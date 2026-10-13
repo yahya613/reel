@@ -61,6 +61,55 @@ GET_PS1 = r'''# Reel one-paste installer for Windows (layer 2).
 }}
 '''
 
+# App files refreshed by a quick update (no Python/mpv/brew re-download).
+RUNTIME = ['reel.pyw', 'library.py', 'media.py', 'player.py', 'browse.py', 'theme.py', 'cloud.py', 'server.py',
+           'supabase.sql', 'requirements.txt', 'tools/seal.py']
+
+UPDATE_SH = '''#!/bin/bash
+# Update an existing Reel install (Mac). Paste:  curl -fsSL {base}/update.sh | bash
+main() {{
+  set -e
+  BASE="{base}"; DEST="$HOME/Reel"
+  [ -f "$DEST/reel.pyw" ] || {{ echo "Reel isn't installed in ~/Reel - run the full installer instead."; exit 1; }}
+  printf "\\n\\033[1;34m==>\\033[0m \\033[1mUpdating Reel\\033[0m\\n"
+  for f in {files}; do
+    dest="$DEST/${{f//__//}}"; mkdir -p "$(dirname "$dest")"
+    curl -fsSL "$BASE/$f" -o "$dest"
+  done
+  "$DEST/.venv/bin/python" -m pip install --quiet -r "$DEST/requirements.txt" >/dev/null 2>&1 || true
+  pkill -f 'Reel/reel.pyw' 2>/dev/null || true; sleep 1
+  echo "Updated. Reopening Reel…"
+  open -a "$HOME/Applications/Reel.app" 2>/dev/null || ( "$DEST/.venv/bin/python" "$DEST/reel.pyw" >/dev/null 2>&1 & )
+}}
+main "$@"
+'''
+
+UPDATE_PS1 = '''# Update an existing Reel install (Windows). Paste in PowerShell:
+#   [Net.ServicePointManager]::SecurityProtocol='Tls12'; irm {base}/update.ps1 | iex
+& {{
+  $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
+  [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+  $base='{base}'
+  $dest = Join-Path $env:LOCALAPPDATA 'Programs\\Reel'
+  if (-not (Test-Path "$dest\\reel.pyw")) {{ $dest = 'C:\\Reel' }}
+  if (-not (Test-Path "$dest\\reel.pyw")) {{ Write-Host 'Reel not found - run the full installer first.' -ForegroundColor Yellow; return }}
+  Write-Host "`n==> Updating Reel" -ForegroundColor Cyan
+  Get-CimInstance Win32_Process -Filter "Name like 'python%'" | Where-Object {{ $_.CommandLine -like '*reel.pyw*' }} |
+    ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}
+  foreach ($f in @({winfiles})) {{
+    $d = Join-Path $dest ($f -replace '__', '\\')
+    New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null
+    Invoke-WebRequest "$base/$f" -OutFile $d -UseBasicParsing
+  }}
+  $py = Join-Path $dest '.venv\\Scripts\\python.exe'
+  if (Test-Path $py) {{ & $py -m pip install --quiet -r "$dest\\requirements.txt" 2>$null }}
+  $pyw = Join-Path $dest '.venv\\Scripts\\pythonw.exe'
+  if (-not (Test-Path $pyw)) {{ $pyw = 'pythonw' }}
+  Write-Host 'Updated. Reopening Reel…' -ForegroundColor Green
+  Start-Process $pyw -ArgumentList "`"$dest\\reel.pyw`"" -WorkingDirectory $dest
+}}
+'''
+
 
 def token():
     out = subprocess.run(['git', 'credential', 'fill'], input=f'protocol=https\nhost=github.com\nusername={OWNER}\n\n',
@@ -96,13 +145,21 @@ def gist():
     files['manifest.txt'] = {'content': '\n'.join(f.replace('/', '__') for f in APP_FILES) + '\n'}
     files['get.sh'] = {'content': GET_SH.format(base=base)}
     files['get.ps1'] = {'content': GET_PS1.format(base=base)}
-    files['README.md'] = {'content': f'# Reel installer\n\nMac (Terminal):\n```\ncurl -fsSL {base}/get.sh | bash\n```\n\n'
-                                     f'Windows (PowerShell):\n```\n[Net.ServicePointManager]::SecurityProtocol=\'Tls12\'; '
-                                     f'irm {base}/get.ps1 | iex\n```\n'}
+    files['update.sh'] = {'content': UPDATE_SH.format(base=base, files=' '.join(f.replace('/', '__') for f in RUNTIME))}
+    files['update.ps1'] = {'content': UPDATE_PS1.format(
+        base=base, winfiles=','.join(f"'{f.replace('/', '__')}'" for f in RUNTIME))}
+    win = f"[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm {base}/{{}} | iex"
+    files['README.md'] = {'content':
+        f'# Reel installer\n\n## Install\n**Mac** (Terminal):\n```\ncurl -fsSL {base}/get.sh | bash\n```\n'
+        f'**Windows** (PowerShell):\n```\n{win.format("get.ps1")}\n```\n\n'
+        f'## Update (keeps settings; faster)\n**Mac**:\n```\ncurl -fsSL {base}/update.sh | bash\n```\n'
+        f'**Windows**:\n```\n{win.format("update.ps1")}\n```\n'}
     api('PATCH', f'/gists/{gid}', {'description': 'Reel installer', 'files': files})
     print('gist', gid)
-    print('MAC', f'curl -fsSL {base}/get.sh | bash')
-    print('WIN', f"[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm {base}/get.ps1 | iex")
+    print('INSTALL MAC', f'curl -fsSL {base}/get.sh | bash')
+    print('INSTALL WIN', win.format('get.ps1'))
+    print('UPDATE  MAC', f'curl -fsSL {base}/update.sh | bash')
+    print('UPDATE  WIN', win.format('update.ps1'))
 
 
 def release(tag):
