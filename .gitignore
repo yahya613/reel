@@ -1,0 +1,19 @@
+# private / machine-specific
+seed.json
+secrets/*.json
+!secrets/*.enc
+*.passphrase
+
+# big binaries (installers download them)
+lib/
+*.dll
+*.exe
+dist/
+
+# build + editor junk
+__pycache__/
+*.pyc
+.venv/
+reel.ico
+.DS_Store
+Thumbs.db
