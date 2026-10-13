@@ -3,7 +3,9 @@
 **A clean, Plex-style movie & TV player for Windows and Mac.**
 Reel finds the video files on your computer, turns them into a proper library with posters, plots and episode names, plays anything (it uses the mpv engine), remembers where you stopped, and lets your other computers stream your library over Wi-Fi or from anywhere.
 
-> Private project. Videos stay on your own computers. Only small bits of data, like where you stopped and the list of titles, go to the cloud.
+> Your videos stay on your own computers. Only small bits of data, like where you stopped and the list of titles, go to the cloud.
+>
+> **License:** free for personal / noncommercial use — you may not sell it or make money off it. See [LICENSE](LICENSE.md).
 
 ---
 
@@ -119,3 +121,9 @@ Data lives in `%APPDATA%\Reel` (Windows) or `~/Library/Application Support/Reel`
 - **Windows firewall prompt:** click **Allow** so your other computers can stream.
 - **Mac asks for Downloads/Desktop access:** click **Allow** so the scan can see your files.
 - **Something broke:** check `reel.log` in the data folder.
+
+## License
+
+**PolyForm Noncommercial License 1.0.0** — Copyright © 2026 Yahya.
+
+Reel is free to use, modify and share for any **noncommercial** purpose (personal use, hobby projects, study, nonprofits, schools). **You may not sell it or use it to make money.** For commercial use, contact the copyright holder. Full terms in [LICENSE.md](LICENSE.md).
