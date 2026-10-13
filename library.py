@@ -82,6 +82,68 @@ def cut_quality(s):
     return s[:m.start()] if m else s
 
 
+# -- collections: group sequels / franchise films that share a name -----------
+# multi-letter roman numerals only (so a trailing single "X"/"V" like "Malcolm X" is NOT treated as a sequel)
+_ROMAN2 = r'(?:ii|iii|iv|vi|vii|viii|ix|xi|xii|xiii)'
+# what the tail of a title must look like for "<base> <tail>" to count as a sequel of "<base>"
+SEQUEL_REMAINDER = re.compile(
+    r'^(?:\d+'
+    r'|(?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii)\b'
+    r'|the\s+(?:second|third|fourth|fifth|sixth|final|last|beginning|awakening|reckoning|movie)\b'
+    r'|(?:part|chapter|vol|volume|episode)\b'
+    r'|(?:two|three|four|five|six)\b'
+    r'|reloaded|revolution|revolutions|resurrection|resurrections|resurgence|retribution|apocalypse'
+    r'|forever|returns?|rises?|begins|awakens?|awakening|unleashed|reborn|rebirth|origins?|legacy'
+    r'|redemption|generations?|nemesis|insurrection|homecoming|endgame|infinity|ragnarok|dominion|supremacy|ultimatum'
+    r')\b', re.I)
+
+
+def collection_key(title):
+    """A key shared by films in the same series by name: Iron Man / Iron Man 2 / Iron Man 3 → 'iron man'.
+    Keeps 'Mission: Impossible' whole, cuts real subtitles, drops Part/Chapter/numbers/roman and 'and the …'."""
+    t = (title or '').lower().strip()
+    t = re.split(r'\s[-–—]\s', t, 1)[0]                     # drop ' - Subtitle'
+    m = re.search(r':\s', t)                                # drop ': Subtitle' only if 2+ words precede
+    if m and len(t[:m.start()].split()) >= 2:
+        t = t[:m.start()]
+    t = re.sub(r'\s+and the\b.*$', '', t)                   # Harry Potter and the …
+    t = re.sub(r'\s+\b(part|chapter|vol(?:ume)?|episode|ep)\b.*$', '', t)
+    t = re.sub(rf'\s+(?:\d{{1,2}}|{_ROMAN2})$', '', t)      # trailing sequel number / multi-letter roman
+    t = re.sub(r'[^a-z0-9]+', ' ', t).strip()
+    return t
+
+
+def collection_label(titles):
+    """A display name for a collection: the longest shared word-prefix of its films."""
+    parts = [t.split() for t in titles if t]
+    if not parts:
+        return ''
+    common = []
+    for i in range(min(len(p) for p in parts)):
+        tok = parts[0][i]
+        if all(p[i].lower().rstrip(':') == tok.lower().rstrip(':') for p in parts):
+            common.append(tok.rstrip(':'))
+        else:
+            break
+    name = ' '.join(common).strip(' :-–—')
+    while True:
+        trimmed = re.sub(r'\s+(and|the|of|part|chapter|vol(?:ume)?|episode|ep|a|an|&)$', '', name, flags=re.I).strip(' :-–—')
+        if trimmed == name:
+            return name
+        name = trimmed
+
+
+def same_series(a, b):
+    """True if `b` is a sequel of `a`: `a` is a whole-word prefix of `b` AND the tail reads like a
+    sequel marker (The Matrix → The Matrix Reloaded; Blade Runner → Blade Runner 2049). The tail test
+    is what stops false merges like Frozen → Frozen River or Ghost → Ghost Rider."""
+    a = re.sub(r'[^a-z0-9]+', ' ', (a or '').lower()).strip()
+    b = re.sub(r'[^a-z0-9]+', ' ', (b or '').lower()).strip()
+    if not a or len(a.replace(' ', '')) < 5 or a == b or not b.startswith(a + ' '):
+        return False
+    return bool(SEQUEL_REMAINDER.match(b[len(a) + 1:].strip()))
+
+
 def norm_key(name):
     s = re.sub(r'\(?\b(19|20)\d{2}\b\)?', ' ', name.lower())
     s = s.replace('&', 'and')

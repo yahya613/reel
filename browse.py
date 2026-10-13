@@ -95,7 +95,15 @@ class Card(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         w = self.width()
-        ir = QRectF(0, 0, w, round(self.img_h(w)))
+        full = QRectF(0, 0, w, round(self.img_h(w)))
+        ir = full
+        if d.get('stack'):                 # draw two offset cards behind, so a collection reads as a set
+            ir = full.adjusted(0, 7, 0, 0)
+            for i, inset in enumerate((10, 5)):
+                layer = QRectF(inset, (2 - i) * 3.5, w - 2 * inset, ir.height())
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 255, 255, 30 + i * 25))
+                p.drawRoundedRect(layer, 10, 10)
         p.save()
         p.setClipPath(rounded(ir, 10))
         if d.get('pix'):
@@ -112,7 +120,7 @@ class Card(QWidget):
         prog = d.get('progress', 0)
         if 0 < prog < 1:
             p.setPen(Qt.PenStyle.NoPen)
-            bar = QRectF(10, ir.height() - 12, w - 20, 4)
+            bar = QRectF(10, full.height() - 12, w - 20, 4)
             p.setBrush(QColor(0, 0, 0, 140))
             p.drawRoundedRect(bar.adjusted(-1, -1, 1, 1), 3, 3)
             p.setBrush(QColor(255, 255, 255, 80))
@@ -152,7 +160,7 @@ class Card(QWidget):
             p.setFont(f)
             p.drawText(br, Qt.AlignmentFlag.AlignCenter, d['badge'])
         # text
-        y = ir.height() + 8
+        y = full.height() + 8
         p.setPen(QColor(TEXT))
         f = font(14, BOLD)
         p.setFont(f)
@@ -528,6 +536,7 @@ class Browser(QWidget):
         self.store, self.images, self.meta = main.store, main.images, main.meta
         self.lib = main.lib
         self.sort = {'movies': 'added', 'shows': 'added'}
+        self._coll_cache = None
         self.season = {}
         self.history = []
         self.current = ('home', None)
@@ -675,6 +684,85 @@ class Browser(QWidget):
         bits = [str(it.year) if it.year else '', it.quality]
         return mm.get('name') or it.title, '  ·  '.join(b for b in bits if b)
 
+    # ------------------------------------------------------------ collections
+    def movie_title(self, it):
+        return self.movie_meta(it).get('name') or it.title
+
+    def collections(self):
+        """Group movies that share a name / are sequels. Returns ({root: [items by year]}, item.key->root).
+        Near-linear (bucketed) and cached per library version so it's cheap to call every render."""
+        import re
+        from collections import defaultdict
+        sig = (id(self.lib), len(self.lib.items))
+        if self._coll_cache and self._coll_cache[0] == sig:
+            return self._coll_cache[1], self._coll_cache[2]
+        from library import collection_key, same_series
+        movies = self.movies()
+        title = {m.key: self.movie_title(m) for m in movies}
+        clean = {m.key: re.sub(r'[^a-z0-9]+', ' ', title[m.key].lower()).strip() for m in movies}
+        base = {m.key: collection_key(title[m.key]) for m in movies}
+        parent = {m.key: m.key for m in movies}
+
+        def find(k):
+            while parent[k] != k:
+                parent[k] = parent[parent[k]]
+                k = parent[k]
+            return k
+
+        def union(keys):
+            for k in keys[1:]:
+                parent[find(k)] = find(keys[0])
+
+        buckets = defaultdict(list)                     # 1. shared base key (Iron Man / Iron Man 2)
+        for m in movies:
+            if len(base[m.key]) >= 3:
+                buckets[base[m.key]].append(m.key)
+        for ks in buckets.values():
+            union(ks)
+        stems = defaultdict(list)                       # 2. same pre-colon stem (Avengers: …, Thor: …)
+        for m in movies:
+            t = title[m.key].lower()
+            i = t.find(': ')
+            s = re.sub(r'[^a-z0-9]+', ' ', t[:i]).strip() if i > 0 else ''
+            if len(s.replace(' ', '')) >= 4:
+                stems[s].append(m.key)
+        for ks in stems.values():
+            union(ks)
+        owned = {}                                      # 3. prefix sequels (The Matrix → …Reloaded)
+        for m in movies:
+            owned.setdefault(clean[m.key], m.key)
+        for m in movies:                                # look up whether a shorter owned title is this one's base
+            toks = clean[m.key].split(' ')
+            for j in range(len(toks) - 1, 0, -1):
+                base_title = ' '.join(toks[:j])
+                root_key = owned.get(base_title)
+                if root_key and root_key != m.key and same_series(base_title, clean[m.key]):
+                    parent[find(m.key)] = find(root_key)
+                    break
+        groups = defaultdict(list)
+        for m in movies:
+            groups[find(m.key)].append(m)
+        colls, member = {}, {}
+        for root, items in groups.items():
+            if len(items) >= 2:
+                items.sort(key=lambda m: (m.year or 9999, title[m.key].lower()))
+                colls[root] = items
+                for m in items:
+                    member[m.key] = root
+        self._coll_cache = (sig, colls, member)
+        return colls, member
+
+    def collection_name(self, items):
+        from library import collection_label
+        return collection_label([self.movie_title(m) for m in items]) or self.movie_title(items[0])
+
+    def collection_poster(self, items):
+        for m in items:                    # the earliest film with artwork represents the set
+            pm = self.images.remote(self.movie_meta(m).get('poster')) if self.movie_meta(m).get('poster') else None
+            if pm:
+                return pm
+        return None
+
     # ------------------------------------------------------------ card resolvers
     def movie_card(self, it):
         def resolve():
@@ -684,6 +772,15 @@ class Browser(QWidget):
             return {'title': mm.get('name') or it.title, 'sub': sub, 'pix': pm, 'progress': self.store.fraction(it),
                     'watched': self.store.watched(it), 'icon': 'film'}
         return Card('poster', resolve, lambda: self.open_movie(it), lambda pos: self.item_menu(it, pos))
+
+    def collection_card(self, root, items):
+        def resolve():
+            unwatched = sum(1 for m in items if not self.store.watched(m))
+            return {'title': self.collection_name(items), 'sub': f'{len(items)} movies', 'pix': self.collection_poster(items),
+                    'icon': 'film', 'count': unwatched if 0 < unwatched < len(items) else 0,
+                    'watched': unwatched == 0, 'stack': True}
+        return Card('poster', resolve, lambda: self.go('collection', root),
+                    lambda pos: self.collection_menu(items, pos))
 
     def show_card(self, show):
         def resolve():
@@ -731,12 +828,15 @@ class Browser(QWidget):
 
     def _meta_ready(self, key):
         self.repaint_timer.start()
-        if self.current[0] in ('movies', 'home', 'search'):
+        if key.startswith('movie:'):     # a title/poster resolved → grouping may change
+            self._coll_cache = None
+        if self.current[0] in ('movies', 'collection', 'home', 'search'):
             self.meta_timer.start()
 
     # ------------------------------------------------------------ navigation
     def set_library(self, lib):
         self.lib = lib
+        self._coll_cache = None
         self.nav['movies'].count = str(len(self.movies())) if lib.items else ''
         self.nav['shows'].count = str(len(lib.shows)) if lib.items else ''
         for b in self.nav.values():
@@ -770,11 +870,12 @@ class Browser(QWidget):
     def render(self, keep_scroll=False):
         page, arg = self.current
         for k, b in self.nav.items():
-            b.setChecked(k == page or (k == 'shows' and page == 'show') or (k == 'movies' and page == 'movie'))
+            b.setChecked(k == page or (k == 'shows' and page == 'show')
+                         or (k == 'movies' and page in ('movie', 'collection')))
         self.btn_back.setVisible(bool(self.history) and page not in ('home',))
         self.nav['movies'].count = str(len(self.movies())) if self.lib.items else ''
         {'home': self.render_home, 'movies': self.render_movies, 'shows': self.render_shows,
-         'show': self.render_show, 'movie': self.render_movie,
+         'show': self.render_show, 'movie': self.render_movie, 'collection': self.render_collection,
          'search': self.render_search}[page](arg, keep_scroll)
 
     def _do_search(self):
@@ -842,18 +943,19 @@ class Browser(QWidget):
         iv = QVBoxLayout(inner)
         iv.setContentsMargins(40, 0, 40, 0)
         iv.setSpacing(12)
+        # Home stays focused on what you're watching. Everything else lives under Movies / TV Shows.
         if cw:
             iv.addWidget(section('Continue Watching', top=4)[0])
-            iv.addWidget(Grid([self.wide_card(it, mode) for it, mode in cw], 300, max_rows=1))
-        movies = sorted(self.movies(), key=lambda m: -m.added)
-        if movies:
-            w, h = section('Recently Added Movies')
-            iv.addWidget(w)
-            iv.addWidget(Grid([self.movie_card(m) for m in movies[:24]], 170, max_rows=1))
-        shows = sorted(self.lib.shows.values(), key=lambda s: -s.added)
-        if shows:
-            iv.addWidget(section('Recently Added TV')[0])
-            iv.addWidget(Grid([self.show_card(s) for s in shows[:24]], 170, max_rows=1))
+            iv.addWidget(Grid([self.wide_card(it, md) for it, md in cw], 300, max_rows=2))
+        else:
+            movies = sorted(self.movies(), key=lambda m: -m.added)
+            shows = sorted(self.lib.shows.values(), key=lambda s: -s.added)
+            if movies:
+                iv.addWidget(section('Recently Added Movies')[0])
+                iv.addWidget(Grid([self.movie_card(m) for m in movies[:12]], 170, max_rows=1))
+            if shows:
+                iv.addWidget(section('Recently Added TV')[0])
+                iv.addWidget(Grid([self.show_card(s) for s in shows[:12]], 170, max_rows=1))
         v.addWidget(inner)
         v.addStretch(1)
 
@@ -898,26 +1000,102 @@ class Browser(QWidget):
     def render_movies(self, _, keep_scroll=False):
         v = self.page.fresh(keep_scroll=keep_scroll)
         self.pages.setCurrentWidget(self.page)
-        movies = self.movies()
-        w, h = section('Movies', f'{len(movies)}', top=6)
+        colls, member = self.collections()
+        singles = [m for m in self.movies() if m.key not in member]
+        total = len(singles) + sum(len(it) for it in colls.values())
+        # one "entry" per standalone movie or per collection, so sequels fold into one tile
+        entries = [('movie', m) for m in singles] + [('coll', root, items) for root, items in colls.items()]
+        w, h = section('Movies', f'{total}', top=6)
         v.addWidget(w)
         mode = self.sort['movies']
         v.addWidget(pills([('added', 'Recently added'), ('az', 'A–Z'), ('year', 'Year'), ('rating', 'Rating'),
                            ('unwatched', 'Unwatched')], mode,
                           lambda k: (self.sort.__setitem__('movies', k), self.render())))
+
+        def added(e):
+            return max(m.added for m in (e[2] if e[0] == 'coll' else [e[1]]))
+
+        def year(e):
+            return max((m.year or 0) for m in (e[2] if e[0] == 'coll' else [e[1]]))
+
+        def rating(e):
+            return max(float(self.movie_meta(m).get('rating') or 0) for m in (e[2] if e[0] == 'coll' else [e[1]]))
+
+        def az(e):
+            t = (self.collection_name(e[2]) if e[0] == 'coll' else self.movie_title(e[1])).lower()
+            return t[4:] if t.startswith('the ') else t
         if mode == 'added':
-            movies.sort(key=lambda m: -m.added)
+            entries.sort(key=lambda e: -added(e))
         elif mode == 'year':
-            movies.sort(key=lambda m: -(m.year or 0))
+            entries.sort(key=lambda e: -year(e))
         elif mode == 'rating':
-            movies.sort(key=lambda m: -float(self.movie_meta(m).get('rating') or 0))
+            entries.sort(key=lambda e: -rating(e))
         elif mode == 'unwatched':
-            movies = [m for m in movies if not self.store.watched(m)]
-        if not movies:
+            entries = [e for e in entries if any(not self.store.watched(m) for m in (e[2] if e[0] == 'coll' else [e[1]]))]
+            entries.sort(key=az)
+        else:
+            entries.sort(key=az)
+        if not entries:
             v.addWidget(label('No movies found yet. Press “Scan computer” to look again.', 15, MUTED))
         v.addSpacing(6)
-        v.addWidget(Grid([self.movie_card(m) for m in movies], 170))
+        cards = [self.collection_card(e[1], e[2]) if e[0] == 'coll' else self.movie_card(e[1]) for e in entries]
+        v.addWidget(Grid(cards, 170))
         v.addStretch(1)
+
+    def render_collection(self, root, keep_scroll=False):
+        colls, _ = self.collections()
+        items = colls.get(root) or next((it for it in colls.values() if any(m.key == root for m in it)), None)
+        if not items:
+            return self.go('movies', push=False)
+        v = self.page.fresh((0, 0, 0, 48), keep_scroll)
+        self.pages.setCurrentWidget(self.page)
+        name = self.collection_name(items)
+        hero = Hero(lambda: self.collection_poster_bg(items), 360)
+        hb = QVBoxLayout(hero)
+        hb.setContentsMargins(40, 40, 40, 30)
+        hb.addStretch(1)
+        hb.addWidget(label('COLLECTION', 12, ACCENT2, HEAVY))
+        hb.addWidget(label(name, 44, TEXT, HEAVY, wrap=True, maxw=820))
+        watched = sum(1 for m in items if self.store.watched(m))
+        years = [m.year for m in items if m.year]
+        span = f'{min(years)}–{max(years)}' if len(set(years)) > 1 else (str(years[0]) if years else '')
+        hb.addWidget(label('   ·   '.join(x for x in (f'{len(items)} movies', span,
+                                                      f'{watched}/{len(items)} watched' if watched else '') if x), 15, '#d0d0da', BOLD))
+        hb.addSpacing(8)
+        nxt = next((m for m in items if not self.store.watched(m)), items[0])
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        b = PillButton(f'Play {self.movie_title(nxt)}', 'play', 'light', h=46, px=15)
+        b.clicked.connect(lambda: self.play.emit(nxt, None))
+        row.addWidget(b)
+        row.addStretch(1)
+        hb.addLayout(row)
+        v.addWidget(hero)
+        inner = QWidget()
+        iv = QVBoxLayout(inner)
+        iv.setContentsMargins(40, 0, 40, 0)
+        iv.addWidget(Grid([self.movie_card(m) for m in items], 170))
+        v.addWidget(inner)
+        v.addStretch(1)
+
+    def collection_poster_bg(self, items):
+        for m in items:
+            bg = self.movie_meta(m).get('background')
+            if bg:
+                pm = self.images.remote(bg)
+                if pm:
+                    return pm
+        return self.images.frame(items[0])
+
+    def collection_menu(self, items, pos):
+        m = QMenu(self)
+        m.setStyleSheet(MENU_CSS)
+        m.setFont(font(13.5))
+        nxt = next((x for x in items if not self.store.watched(x)), items[0])
+        m.addAction(f'Play {self.movie_title(nxt)}', lambda: self.play.emit(nxt, None))
+        m.addAction('Mark all watched', lambda: ([self.store.set_watched(x, True) for x in items], self.render(keep_scroll=True)))
+        m.addAction('Mark all unwatched', lambda: ([self.store.set_watched(x, False) for x in items], self.render(keep_scroll=True)))
+        m.exec(pos)
 
     def render_shows(self, _, keep_scroll=False):
         v = self.page.fresh(keep_scroll=keep_scroll)
