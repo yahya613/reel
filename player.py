@@ -1,5 +1,5 @@
 """Player: libmpv rendered into a QOpenGLWidget, with a clean auto-hiding overlay."""
-import os, re, sys
+import os, re, sys, subprocess
 from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QOpenGLContext, QFontMetricsF, QPainterPath
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -63,6 +63,38 @@ def track_text(t):
 
 
 # ---------------------------------------------------------------- video surface
+
+class KeepAwake:
+    """Stop the display from sleeping while a video is actually playing.
+    mpv normally does this itself, but with vo=libmpv (video rendered inside our window)
+    the OS never hears about it, so the screen would sleep mid-movie. We tell it directly.
+    """
+
+    def __init__(self):
+        self.on = False
+        self._proc = None
+
+    def set(self, keep):
+        if keep == self.on:
+            return
+        self.on = keep
+        try:
+            if sys.platform == 'darwin':
+                if keep:
+                    # caffeinate -d = no display sleep; -w <pid> makes it quit if Reel ever does
+                    self._proc = subprocess.Popen(['caffeinate', '-d', '-w', str(os.getpid())],
+                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif self._proc:
+                    self._proc.terminate()
+                    self._proc = None
+            elif sys.platform == 'win32':
+                import ctypes
+                ES_CONTINUOUS, ES_DISPLAY, ES_SYSTEM = 0x80000000, 0x00000002, 0x00000001
+                ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_DISPLAY | ES_SYSTEM if keep else ES_CONTINUOUS)
+        except Exception:
+            pass
+
 
 def _gl_proc(_, name):
     ctx = QOpenGLContext.currentContext()
@@ -556,6 +588,7 @@ class PlayerView(QWidget):
         self.item = None
         self.tracks, self.chapters = [], []
         self.paused = False
+        self.awake = KeepAwake()
         self.upnext_dismissed = False
         self.chapter_kind = ''
         self.is_fs = False
@@ -718,6 +751,7 @@ class PlayerView(QWidget):
             if self._resumed:
                 self.toast.flash(f'Resumed at {fmt_time(self._resumed)}  ·  Home to start over', 3200)
             self.tick()
+            self._update_awake()
         elif kind == 'error':
             self.toast.flash(f"Can't reach {self.item.remote} - is Reel open there?" if self.item and self.item.remote
                              else "Can't play this file", 3500)
@@ -746,6 +780,7 @@ class PlayerView(QWidget):
         if name == 'pause':
             self.paused = bool(v)
             self.btn_play.set_icon('play' if self.paused else 'pause')
+            self._update_awake()
             self.poke()
         elif name == 'eof-reached':
             if v:
@@ -936,8 +971,12 @@ class PlayerView(QWidget):
         self.save_timer.stop()
         self.m.command('stop')
         self.item = None
+        self.awake.set(False)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.closed.emit()
+
+    def _update_awake(self):
+        self.awake.set(self.item is not None and not self.paused)
 
     def toggle_panel(self):
         if self.panel.isVisible():
