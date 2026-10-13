@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QFileDia
 import library
 from library import Library, Store, parse, path_key, fmt_dur, DATA_DIR, VIDEO_EXT
 from theme import BG, SURFACE, SURFACE2, BORDER, TEXT, MUTED, ACCENT, font, BOLD, HEAVY, app_icon, PillButton, IconButton
-from media import Images, Metadata
+from media import Images, Metadata, Catalog
 from cloud import Cloud, sync_id
 from server import MediaServer, Tunnel
 from player import PlayerView
@@ -229,6 +229,7 @@ class Main(QMainWindow):
         self._quitting = False
         self.images = Images()
         self.meta = Metadata(self.store)
+        self.catalog = Catalog(self.store)
         self.cloud = Cloud(self.store)
         self.store.on_change = self.cloud.mark
         self.scanning = False
@@ -252,6 +253,7 @@ class Main(QMainWindow):
         self.player.title_changed.connect(lambda t: self.setWindowTitle(f'{t} — Reel'))
         self.scan_progress.connect(self._on_scan_progress)
         self.scan_done.connect(self._on_scan_done)
+        self.catalog.ready.connect(self.browser.on_catalog_ready)
         self.cloud.status.connect(self.browser.set_cloud_status)
         self.cloud.synced.connect(self._on_synced)
         self.servers = []                       # reachable other computers {name, base, token}

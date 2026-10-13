@@ -567,7 +567,8 @@ class Browser(QWidget):
         logo.addStretch(1)
         sv.addLayout(logo)
         self.nav = {}
-        for key, icon, text in (('home', 'home', 'Home'), ('movies', 'film', 'Movies'), ('shows', 'tv', 'TV Shows')):
+        for key, icon, text in (('home', 'home', 'Home'), ('discover', 'sparkles', 'Discover'),
+                                ('movies', 'film', 'Movies'), ('shows', 'tv', 'TV Shows')):
             b = NavButton(icon, text)
             b.clicked.connect(lambda _=False, k=key: self.go(k))
             b.setStyleSheet('border:none')
@@ -871,11 +872,13 @@ class Browser(QWidget):
         page, arg = self.current
         for k, b in self.nav.items():
             b.setChecked(k == page or (k == 'shows' and page == 'show')
-                         or (k == 'movies' and page in ('movie', 'collection')))
+                         or (k == 'movies' and page in ('movie', 'collection'))
+                         or (k == 'discover' and page == 'reco'))
         self.btn_back.setVisible(bool(self.history) and page not in ('home',))
         self.nav['movies'].count = str(len(self.movies())) if self.lib.items else ''
-        {'home': self.render_home, 'movies': self.render_movies, 'shows': self.render_shows,
-         'show': self.render_show, 'movie': self.render_movie, 'collection': self.render_collection,
+        {'home': self.render_home, 'discover': self.render_discover, 'movies': self.render_movies,
+         'shows': self.render_shows, 'show': self.render_show, 'movie': self.render_movie,
+         'collection': self.render_collection, 'reco': self.render_reco,
          'search': self.render_search}[page](arg, keep_scroll)
 
     def _do_search(self):
@@ -1139,6 +1142,204 @@ class Browser(QWidget):
             v.addWidget(section('Episodes', str(len(eps)))[0])
             v.addWidget(Grid([self.wide_card(e) for e in eps[:60]], 280))
         v.addStretch(1)
+
+    # ------------------------------------------------------------ Discover (recommendations + watchlist)
+    def owned_keys(self):
+        keys = {norm_key(self.movie_title(m)) for m in self.movies()}
+        keys |= {norm_key(self.show_meta(s).get('name') or s.name) for s in self.lib.shows.values()}
+        return keys
+
+    def taste(self):
+        """Genre weights from what you own and (more so) what you've watched."""
+        from collections import defaultdict
+        w = defaultdict(float)
+        for m in self.movies():
+            for g in self.movie_meta(m).get('genres', []):
+                w[g] += 2.5 if self.store.watched(m) else 1.0
+        for s in self.lib.shows.values():
+            hot = any(self.store.watched(e) for e in s.episodes)
+            for g in self.show_meta(s).get('genres', []):
+                w[g] += 2.5 if hot else 1.0
+        return w
+
+    def recommend(self, kind, weights, genres, n=24, exclude=()):
+        owned = self.owned_keys()
+        skip = set(self.store.settings.data.get('reco_hidden', [])) | set(exclude)
+        seen, out = set(), []
+        pool = list(self.main.catalog.get(kind))          # trending
+        for g in genres:
+            pool += self.main.catalog.get(kind, g)         # per-genre top
+        for c in pool:
+            cid = c.get('id')
+            if not cid or cid in seen or cid in skip or norm_key(c.get('name', '')) in owned:
+                continue
+            seen.add(cid)
+            score = sum(weights.get(g, 0) for g in c.get('genres', [])) + float(c.get('rating') or 0) * 0.3
+            out.append((score, c))
+        out.sort(key=lambda sc: -sc[0])
+        return [c for _, c in out[:n]]
+
+    def watchlist(self):
+        return self.store.settings.data.setdefault('watchlist', [])
+
+    def in_watchlist(self, cid):
+        return any(w.get('id') == cid for w in self.watchlist())
+
+    def toggle_watchlist(self, cand):
+        wl = self.watchlist()
+        cid = cand.get('id')
+        if self.in_watchlist(cid):
+            wl[:] = [w for w in wl if w.get('id') != cid]
+        else:
+            wl.insert(0, {k: cand.get(k) for k in ('id', 'kind', 'name', 'year', 'poster', 'background',
+                                                   'rating', 'genres', 'description')})
+        self.store.settings.save()
+
+    def owned_item(self, cand):
+        """If a recommended title is already in your library, return (item_or_show, is_show)."""
+        key = norm_key(cand.get('name', ''))
+        if cand.get('kind') == 'series':
+            for s in self.lib.shows.values():
+                if norm_key(self.show_meta(s).get('name') or s.name) == key:
+                    return s, True
+        else:
+            for m in self.movies():
+                if norm_key(self.movie_title(m)) == key:
+                    return m, False
+        return None, False
+
+    def on_catalog_ready(self, key):
+        self.repaint_timer.start()
+        if self.current[0] in ('discover', 'reco'):
+            self.meta_timer.start()
+
+    def reco_card(self, cand):
+        def resolve():
+            owned_it, _ = self.owned_item(cand)
+            sub = '  ·  '.join(x for x in (str(cand.get('year', ''))[:4],
+                                           f'★ {cand["rating"]}' if cand.get('rating') else '') if x)
+            return {'title': cand.get('name', ''), 'sub': sub,
+                    'pix': self.images.remote(cand.get('poster')) if cand.get('poster') else None,
+                    'icon': 'tv' if cand.get('kind') == 'series' else 'film',
+                    'badge': 'IN LIBRARY' if owned_it else ('WATCHLIST' if self.in_watchlist(cand.get('id')) else '')}
+        return Card('poster', resolve, lambda: self.go('reco', cand), lambda pos: self.reco_menu(cand, pos))
+
+    def reco_menu(self, cand, pos):
+        m = QMenu(self)
+        m.setStyleSheet(MENU_CSS)
+        m.setFont(font(13.5))
+        owned_it, is_show = self.owned_item(cand)
+        if owned_it:
+            m.addAction('Play' if not is_show else 'Open',
+                        lambda: (self.open_show(owned_it) if is_show else self.play.emit(owned_it, None)))
+        inwl = self.in_watchlist(cand.get('id'))
+        m.addAction('Remove from watchlist' if inwl else 'Add to watchlist',
+                    lambda: (self.toggle_watchlist(cand), self.render(keep_scroll=True)))
+        if not owned_it:
+            m.addSeparator()
+            m.addAction('Not interested',
+                        lambda: (self.store.settings.data.setdefault('reco_hidden', []).append(cand.get('id')),
+                                 self.store.settings.save(), self.render(keep_scroll=True)))
+        m.exec(pos)
+
+    def render_discover(self, _, keep_scroll=False):
+        v = self.page.fresh(keep_scroll=keep_scroll)
+        self.pages.setCurrentWidget(self.page)
+        if not self.main.meta.enabled:
+            v.addWidget(label('Discover needs the online lookup turned on (Library settings → '
+                              '“Download posters, plots and episode names”).', 15, MUTED))
+            v.addStretch(1)
+            return
+        weights = self.taste()
+        top_genres = [g for g, _ in sorted(weights.items(), key=lambda kv: -kv[1])]
+        v.addWidget(section('Discover', top=6)[0])
+        v.addWidget(label('Suggestions based on what you watch. Add things to your watchlist — '
+                          'anything you get later shows up in your library automatically.', 13.5, MUTED))
+        v.addSpacing(4)
+        wl = self.watchlist()
+        if wl:
+            w0, h0 = section('Your Watchlist', str(len(wl)))
+            v.addWidget(w0)
+            v.addWidget(Grid([self.reco_card(c) for c in wl], 170, max_rows=1))
+        movies = self.recommend('movie', weights, top_genres[:3], 24)
+        if movies:
+            v.addWidget(section('Recommended Movies' if top_genres else 'Trending Movies')[0])
+            v.addWidget(Grid([self.reco_card(c) for c in movies], 170, max_rows=1 if top_genres else 2))
+        shows = self.recommend('series', weights, top_genres[:3], 18)
+        if shows:
+            v.addWidget(section('Recommended Shows' if top_genres else 'Trending Shows')[0])
+            v.addWidget(Grid([self.reco_card(c) for c in shows], 170, max_rows=1))
+        for g in top_genres[:3]:
+            picks = self.recommend('movie', weights, [g], 18, exclude=[c['id'] for c in movies])
+            if len(picks) >= 4:
+                v.addWidget(section(f'More {g}')[0])
+                v.addWidget(Grid([self.reco_card(c) for c in picks], 170, max_rows=1))
+        if not (wl or movies or shows):
+            v.addWidget(label('Loading suggestions…' if self.main.meta.enabled else '', 15, MUTED))
+        v.addStretch(1)
+
+    def render_reco(self, cand, keep_scroll=False):
+        v = self.page.fresh((0, 0, 0, 48), keep_scroll)
+        self.pages.setCurrentWidget(self.page)
+        full = self.main.catalog.meta(cand.get('kind', 'movie'), cand.get('id', ''))
+        desc = full.get('description') or cand.get('description', '')
+        cast = full.get('cast') or cand.get('cast', [])
+        hero = Hero(lambda: self.images.remote(cand.get('background')) if cand.get('background') else
+                    (self.images.remote(cand.get('poster')) if cand.get('poster') else None), 520)
+        h = QHBoxLayout(hero)
+        h.setContentsMargins(40, 30, 40, 30)
+        h.setSpacing(36)
+        h.addWidget(ImageBox(lambda: self.images.remote(cand.get('poster')) if cand.get('poster') else None, 250, 375,
+                             cand.get('name', ''), 'tv' if cand.get('kind') == 'series' else 'film', 14),
+                    0, Qt.AlignmentFlag.AlignVCenter)
+        col = QVBoxLayout()
+        col.setSpacing(10)
+        col.addStretch(1)
+        col.addWidget(label(cand.get('name', ''), 42, TEXT, HEAVY, wrap=True, maxw=820))
+        bits = [str(cand.get('year', ''))[:4], f'★ {cand["rating"]}' if cand.get('rating') else '',
+                ', '.join(cand.get('genres', []))]
+        col.addWidget(label('   ·   '.join(b for b in bits if b), 15, '#d0d0da', BOLD))
+        col.addSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        owned_it, is_show = self.owned_item(cand)
+        if owned_it:
+            tag = label(' IN YOUR LIBRARY ', 11, '#0a0a0e', HEAVY)
+            tag.setStyleSheet(f'color:#0a0a0e;background:{ACCENT2};border-radius:5px;padding:3px 8px')
+            pb = PillButton('Open' if is_show else 'Play', 'play', 'light', h=48, px=15)
+            pb.clicked.connect(lambda: self.open_show(owned_it) if is_show else self.play.emit(owned_it, None))
+            row.addWidget(pb)
+        inwl = self.in_watchlist(cand.get('id'))
+        wb = PillButton('In Watchlist ✓' if inwl else 'Add to Watchlist', 'check' if inwl else 'plus',
+                        'ghost' if inwl else 'primary', h=48, px=15)
+        wb.clicked.connect(lambda: (self.toggle_watchlist(cand), self.render(keep_scroll=True)))
+        row.addWidget(wb)
+        if full.get('trailer'):
+            tb = PillButton('Trailer', 'play-o', 'ghost', h=48, px=15)
+            tb.clicked.connect(lambda: self.open_trailer(full['trailer']))
+            row.addWidget(tb)
+        row.addStretch(1)
+        col.addLayout(row)
+        col.addSpacing(6)
+        if desc:
+            col.addWidget(label(desc, 15.5, '#cdcdd7', wrap=True, maxw=760))
+        if cast:
+            col.addWidget(label('Starring ' + ', '.join(cast), 13.5, MUTED, wrap=True, maxw=760))
+        if owned_it:
+            col.addWidget(label('You already have this — press Play.', 13, MUTED))
+        else:
+            col.addWidget(label('Not in your library yet. Add it to your watchlist; once you have the file it '
+                                'appears here automatically.', 13, MUTED, wrap=True, maxw=760))
+        col.addStretch(1)
+        h.addLayout(col, 1)
+        v.addWidget(hero)
+        v.addStretch(1)
+
+    def open_trailer(self, yt):
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        url = yt if str(yt).startswith('http') else f'https://www.youtube.com/watch?v={yt}'
+        QDesktopServices.openUrl(QUrl(url))
 
     def open_movie(self, it):
         self.go('movie', it)

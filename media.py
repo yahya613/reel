@@ -270,3 +270,95 @@ class Metadata(QObject):
         if self.dirty:
             self.dirty = False
             self.db.save()
+
+
+def _slim_catalog(m, kind):
+    imdb = m.get('imdb_id') or (m.get('id') if str(m.get('id', '')).startswith('tt') else '')
+    return {'id': m.get('id'), 'kind': kind, 'name': m.get('name'),
+            'year': str(m.get('releaseInfo') or m.get('year') or '')[:9],
+            'poster': _poster(m.get('poster'), imdb),
+            'background': (m.get('background') or '').replace('/background/small/', '/background/medium/'),
+            'logo': m.get('logo') or '', 'description': m.get('description') or '',
+            'genres': (m.get('genres') or m.get('genre') or [])[:4], 'rating': m.get('imdbRating') or '',
+            'runtime': m.get('runtime') or '', 'cast': (m.get('cast') or [])[:4]}
+
+
+class Catalog(QObject):
+    """Cinemeta's public catalogs (trending / by-genre), for recommendations. Keyless, cached a day."""
+    ready = pyqtSignal(str)
+    GENRES = ['Action', 'Adventure', 'Animation', 'Comedy', 'Crime', 'Documentary', 'Drama', 'Family',
+              'Fantasy', 'History', 'Horror', 'Mystery', 'Romance', 'Sci-Fi', 'Thriller', 'War', 'Western']
+
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+        self.db = JsonFile('catalogs.json', {})
+        self.pending = set()
+        self.pool = ThreadPoolExecutor(4)
+        self.dirty = False
+        self.timer = QTimer(self, interval=5000, timeout=self._flush)
+        self.timer.start()
+
+    @property
+    def enabled(self):
+        return self.store.settings.data.get('online', True)
+
+    def get(self, kind, genre=None, sort='top'):
+        """Return cached metas for a catalog, fetching in the background if stale. kind: 'movie'|'series'."""
+        key = f'{kind}/{sort}/{genre or ""}'
+        rec = self.db.data.get(key)
+        fresh = rec and time.time() - rec.get('t', 0) < 86400
+        if not fresh and self.enabled and key not in self.pending:
+            self.pending.add(key)
+            self.pool.submit(self._fetch, key, kind, sort, genre)
+        return rec.get('metas', []) if rec else []
+
+    def _fetch(self, key, kind, sort, genre):
+        try:
+            url = f'{CINEMETA}/catalog/{kind}/{sort}' + (f'/genre={urllib.parse.quote(genre)}' if genre else '') + '.json'
+            metas = [_slim_catalog(m, kind) for m in http_json(url).get('metas', []) if m.get('name')]
+            with self.db.lock:
+                self.db.data[key] = {'metas': metas, 't': time.time()}
+            self.dirty = True
+            self.ready.emit(key)
+        except Exception:
+            pass
+        finally:
+            self.pending.discard(key)
+
+    def meta(self, kind, cid):
+        """Full meta for one title (for the trailer + full plot on the detail page)."""
+        key = f'full/{kind}/{cid}'
+        rec = self.db.data.get(key)
+        if rec is None and self.enabled and key not in self.pending:
+            self.pending.add(key)
+
+            def run():
+                try:
+                    m = http_json(f'{CINEMETA}/meta/{kind}/{cid}.json').get('meta') or {}
+                    yt = ''
+                    for s in (m.get('trailerStreams') or []):
+                        if s.get('ytId'):
+                            yt = s['ytId']
+                            break
+                    if not yt:
+                        for tr in (m.get('trailers') or []):
+                            if tr.get('source'):
+                                yt = tr['source']
+                                break
+                    with self.db.lock:
+                        self.db.data[key] = {'trailer': yt, 'description': m.get('description') or '',
+                                             'cast': (m.get('cast') or [])[:5], 't': time.time()}
+                    self.dirty = True
+                    self.ready.emit(key)
+                except Exception:
+                    pass
+                finally:
+                    self.pending.discard(key)
+            self.pool.submit(run)
+        return rec or {}
+
+    def _flush(self):
+        if self.dirty:
+            self.dirty = False
+            self.db.save()
