@@ -1,7 +1,7 @@
-# private / machine-specific
+# private / machine-specific (kept out of the public repo)
 seed.json
-secrets/*.json
-!secrets/*.enc
+secrets/
+tools/gist_id.txt
 *.passphrase
 
 # big binaries (installers download them)
