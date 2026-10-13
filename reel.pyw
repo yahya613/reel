@@ -210,6 +210,8 @@ class Main(QMainWindow):
     tunnel_changed = pyqtSignal()
     scan_progress = pyqtSignal(int, int, str)
     scan_done = pyqtSignal(object)
+    uploaded = pyqtSignal(str)        # server saved a file sent from another device
+    upload_status = pyqtSignal(str)   # progress text while this device sends a file
 
     def __init__(self, files):
         super().__init__()
@@ -252,6 +254,11 @@ class Main(QMainWindow):
         self.scan_done.connect(self._on_scan_done)
         self.cloud.status.connect(self.browser.set_cloud_status)
         self.cloud.synced.connect(self._on_synced)
+        self.servers = []                       # reachable other computers {name, base, token}
+        self.server.on_upload = self.uploaded.emit
+        self.uploaded.connect(self._on_uploaded)
+        self.upload_status.connect(self.browser.set_cloud_status)
+        self._uploading = False
         self.update_status()
         self.cloud.push_library(self.local.items, self.server.info())  # also pulls when done
         self._addrs = (self.server.info() or {}).get('urls')
@@ -379,6 +386,8 @@ class Main(QMainWindow):
 
     def _on_synced(self, progress, remotes):
         import hashlib, urllib.parse
+        self.servers = [{'name': r['device'].removesuffix('.local').replace('-', ' '),
+                         'base': r['base'], 'token': r['token']} for r in remotes if r.get('base')]
         items = []
         for r in remotes:
             if not r.get('base'):
@@ -401,6 +410,101 @@ class Main(QMainWindow):
         if self.cloud.apply_progress(self.lib.items, progress) or changed_lib:
             if self.stack.currentWidget() is self.browser:
                 self.browser.render(keep_scroll=True)
+
+    # ------------------------------------------------------------ save a file to the library (all devices)
+    def can_upload(self):
+        # only activated devices (your Supabase creds) with another computer online
+        return bool(self.cloud.on and self.servers)
+
+    def _upload_target(self):
+        if not self.servers:
+            return None
+        pref = self.store.settings.data.get('home_device')
+        return next((s for s in self.servers if s['name'] == pref), self.servers[0])
+
+    def already_shared(self, item):
+        return sync_id(item) in {sync_id(i) for i in self.remote_items}
+
+    def upload_item(self, item):
+        if self._uploading:
+            self.upload_status.emit('Already saving a file — one at a time.')
+            return
+        target = self._upload_target()
+        if not target:
+            self.upload_status.emit('No other computer is online to save to.')
+            return
+        if self.already_shared(item) or not os.path.isfile(item.path):
+            self.upload_status.emit('That’s already in your library.' if self.already_shared(item)
+                                    else 'Can’t find that file.')
+            return
+        self.store.settings.data['home_device'] = target['name']
+        self._uploading = True
+        title = self.browser.titles(item)[0]
+        subdir = ''
+        if item.kind == 'episode':
+            subdir = re.sub(r'[\\/:*?"<>|]', '', item.title)[:80]
+        threading.Thread(target=self._do_upload, args=(item, target, title, subdir), daemon=True).start()
+
+    def _do_upload(self, item, target, title, subdir):
+        import http.client, urllib.parse, urllib.request
+        try:
+            size = os.path.getsize(item.path)
+            try:  # authoritative duplicate check (the cloud list can be a bit stale)
+                q0 = urllib.parse.urlencode({'t': target['token'], 'id': sync_id(item)})
+                if urllib.request.urlopen(f"{target['base']}/have?{q0}", timeout=10).read() == b'yes':
+                    self.upload_status.emit('That’s already in your library.')
+                    return
+            except Exception:
+                pass
+            sp = urllib.parse.urlsplit(target['base'])
+            q = urllib.parse.urlencode({'t': target['token'], 'name': os.path.basename(item.path), 'subdir': subdir})
+            conn = (http.client.HTTPSConnection if sp.scheme == 'https' else http.client.HTTPConnection)(
+                sp.hostname, sp.port, timeout=60)
+            conn.putrequest('POST', f'/upload?{q}', skip_host=False, skip_accept_encoding=True)
+            conn.putheader('Content-Length', str(size))
+            conn.putheader('Content-Type', 'application/octet-stream')
+            conn.endheaders()
+            sent, last = 0, -5
+            with open(item.path, 'rb') as f:
+                while True:
+                    buf = f.read(1024 * 512)
+                    if not buf:
+                        break
+                    conn.send(buf)
+                    sent += len(buf)
+                    pct = int(sent * 100 / size) if size else 100
+                    if pct >= last + 2:
+                        last = pct
+                        self.upload_status.emit(f'Saving “{title}” to your library… {pct}%')
+            resp = conn.getresponse()
+            ok = resp.status == 200
+            resp.read()
+            conn.close()
+            self.upload_status.emit('Saved — it’s now on all your devices.' if ok
+                                    else f'Couldn’t save (server said {resp.status}).')
+            if ok:
+                QTimer.singleShot(1500, self.cloud.sync)
+        except Exception as e:
+            self.upload_status.emit(f'Save failed ({type(e).__name__}). Is the other computer still on?')
+        finally:
+            self._uploading = False
+
+    def _on_uploaded(self, path):
+        # another device sent us a file; add it to this computer's library and share it
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        it = parse(path, st.st_size, time.time())
+        if it.kind == 'video' or self.local.find(path):
+            self.local.save_cache()
+            return
+        self.local.set_items(list(self.local.items) + [it])
+        self.local.save_cache()
+        self.server.update(self.local.items)
+        self.merge()
+        self.cloud.push_library(self.local.items, self.server.info())
+        self.browser.set_cloud_status(f'Received “{it.display}” — added to your library.')
 
     def update_status(self, cancelled=False):
         movies = len(self.browser.movies())

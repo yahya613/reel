@@ -436,7 +436,7 @@ class EpisodeRow(QWidget):
         name = em.get('name') or it.ep_name
         p.drawText(QRectF(x + nw, 18, tw - nw - rw - 10, 22), Qt.AlignmentFlag.AlignVCenter,
                    QFontMetricsF(f).elidedText(name, Qt.TextElideMode.ElideRight, tw - nw - rw - 10))
-        meta = [m for m in (em.get('aired', ''), it.quality, fmt_size(it.size), f'on {it.remote}' if it.remote else '') if m]
+        meta = [m for m in (em.get('aired', ''), it.quality, fmt_size(it.size)) if m]
         p.setFont(font(12.5))
         p.setPen(QColor(MUTED))
         p.drawText(QRectF(x, 44, tw, 18), Qt.AlignmentFlag.AlignVCenter, '  ·  '.join(meta))
@@ -682,7 +682,7 @@ class Browser(QWidget):
             pm = self.images.remote(mm.get('poster')) if mm.get('poster') else None
             sub = '  ·  '.join(x for x in (str(it.year or ''), fmt_dur(self.store.duration(it)) or mm.get('runtime', '')) if x)
             return {'title': mm.get('name') or it.title, 'sub': sub, 'pix': pm, 'progress': self.store.fraction(it),
-                    'watched': self.store.watched(it), 'icon': 'film', 'badge': it.remote.upper()[:14] if it.remote else ''}
+                    'watched': self.store.watched(it), 'icon': 'film'}
         return Card('poster', resolve, lambda: self.open_movie(it), lambda pos: self.item_menu(it, pos))
 
     def show_card(self, show):
@@ -1005,6 +1005,7 @@ class Browser(QWidget):
         wb = PillButton('Mark unwatched' if watched else 'Mark watched', 'check', 'ghost', h=48, px=15)
         wb.clicked.connect(lambda: (self.store.set_watched(it, not watched), self.render(keep_scroll=True)))
         row.addWidget(wb)
+        self._add_save_button(row, it)
         row.addStretch(1)
         col.addLayout(row)
         col.addSpacing(6)
@@ -1024,9 +1025,10 @@ class Browser(QWidget):
         iv = QVBoxLayout(inner)
         iv.setContentsMargins(40, 0, 40, 0)
         iv.addWidget(section('File', top=0)[0])
-        where = f'Streaming from {it.remote}\n' if it.remote else ''
-        iv.addWidget(label(f'{where}{it.path}\n{fmt_size(it.size)}', 13, MUTED, wrap=True))
-        if not it.remote:
+        if it.remote:
+            iv.addWidget(label(f'In your library  ·  {fmt_size(it.size)}', 13, MUTED, wrap=True))
+        else:
+            iv.addWidget(label(f'{it.path}\n{fmt_size(it.size)}', 13, MUTED, wrap=True))
             sf = PillButton('Show in folder', 'folder', 'ghost', h=36, px=13)
             sf.clicked.connect(lambda: reveal(it.path))
             iv.addWidget(sf)
@@ -1108,11 +1110,21 @@ class Browser(QWidget):
         w = self.store.watched(it)
         m.addAction('Mark as unwatched' if w else 'Mark as watched',
                     lambda: (self.store.set_watched(it, not w), self.render(keep_scroll=True)))
+        if not it.remote and self.main.can_upload() and not self.main.already_shared(it):
+            m.addAction('Save to my library', lambda: self.main.upload_item(it))
         if not it.remote:
             m.addSeparator()
             m.addAction('Show in folder', lambda: reveal(it.path))
             m.addAction('Remove from library', lambda: self.main.hide_items([it]))
         m.exec(pos)
+
+    def _add_save_button(self, row, it):
+        """'Save to my library' — only on activated installs, for a local file not yet shared."""
+        if it.remote or not self.main.can_upload() or self.main.already_shared(it):
+            return
+        sb = PillButton('Save to my library', 'plus', 'ghost', h=48, px=15)
+        sb.clicked.connect(lambda: self.main.upload_item(it))
+        row.addWidget(sb)
 
     def show_menu(self, show, pos):
         m = QMenu(self)

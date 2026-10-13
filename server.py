@@ -5,7 +5,7 @@ Only files in the library are served, and every request needs this install's sec
 """
 import os, re, sys, json, time, shutil, socket, hashlib, secrets, threading, mimetypes, subprocess, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from library import SUB_EXT
+from library import SUB_EXT, VIDEO_EXT
 
 PORTS = range(8642, 8652)
 CHUNK = 1024 * 1024
@@ -13,6 +13,13 @@ CHUNK = 1024 * 1024
 
 def vid(item):
     return hashlib.sha1(item.key.encode()).hexdigest()[:16]
+
+
+def safe_name(name):
+    """A filename with no path tricks — just the base name, cleaned."""
+    name = urllib.parse.unquote(name or '').replace('\\', '/').split('/')[-1]
+    name = re.sub(r'[\x00-\x1f<>:"|?*]', '', name).strip().strip('.')
+    return name[:180]
 
 
 def local_addresses():
@@ -68,9 +75,21 @@ class MediaServer:
         self.port = None
         self.httpd = None
         self.tunnel = None
+        self.on_upload = None   # main window sets this; called (on its thread) with the saved path
+        self.have = set()       # sync_ids already here, so other devices don't upload duplicates
+
+    def library_dir(self):
+        d = self.store.settings.data.get('upload_dir')
+        if not d:
+            home = os.path.expanduser('~')
+            base = os.path.join(home, 'Movies') if sys.platform == 'darwin' else os.path.join(home, 'Videos')
+            d = os.path.join(base, 'Reel Library')
+        return d
 
     def update(self, items):
         self.files = {vid(i): i.path for i in items if not i.remote}
+        from cloud import sync_id
+        self.have = {sync_id(i) for i in items if not i.remote}
 
     def start(self, items):
         self.update(items)
@@ -90,6 +109,64 @@ class MediaServer:
             def do_HEAD(self):
                 self.do_GET(head=True)
 
+            def do_POST(self):
+                u = urllib.parse.urlsplit(self.path)
+                q = urllib.parse.parse_qs(u.query)
+                if q.get('t', [''])[0] != server.token:
+                    return self._deny(403)
+                if u.path.rstrip('/') != '/upload':
+                    return self._deny()
+                name = safe_name(q.get('name', [''])[0])
+                subdir = safe_name(q.get('subdir', [''])[0]) if q.get('subdir', [''])[0] else ''
+                if not name or os.path.splitext(name)[1].lower() not in VIDEO_EXT:
+                    return self._reply(400, b'bad name')
+                try:
+                    length = int(self.headers.get('Content-Length') or 0)
+                except ValueError:
+                    length = 0
+                folder = os.path.join(server.library_dir(), subdir) if subdir else server.library_dir()
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                except OSError:
+                    return self._reply(500, b'cannot write')
+                dest = os.path.join(folder, name)
+                # Always read the whole body (even if it's a duplicate) so the sender finishes cleanly.
+                exists = os.path.exists(dest) and os.path.getsize(dest) == length
+                tmp = dest + '.part'
+                got = 0
+                try:
+                    with open(os.devnull if exists else tmp, 'wb') as f:
+                        while got < length:
+                            buf = self.rfile.read(min(CHUNK, length - got))
+                            if not buf:
+                                break
+                            f.write(buf)
+                            got += len(buf)
+                    if exists:
+                        return self._reply(200, b'exists')
+                    if got < length:
+                        raise IOError('short upload')
+                    os.replace(tmp, dest)
+                except Exception:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    return self._reply(500, b'write failed')
+                if server.on_upload:
+                    server.on_upload(dest)
+                self._reply(200, b'saved')
+
+            def _reply(self, code, body):
+                self.send_response(code)
+                self.send_header('Content-Type', 'text/plain')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+
             def do_GET(self, head=False):
                 u = urllib.parse.urlsplit(self.path)
                 q = urllib.parse.parse_qs(u.query)
@@ -97,14 +174,10 @@ class MediaServer:
                     return self._deny(403)
                 parts = [p for p in u.path.split('/') if p]
                 if parts == ['ping']:
-                    body = b'reel'
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers()
-                    if not head:
-                        self.wfile.write(body)
-                    return
+                    return self._reply(200, b'reel') if not head else self._reply(200, b'')
+                if parts == ['have']:  # does this computer already have this title?
+                    yes = q.get('id', [''])[0] in server.have
+                    return self._reply(200, b'yes' if yes else b'no') if not head else self._reply(200, b'')
                 if len(parts) < 2 or parts[1] not in server.files:
                     return self._deny()
                 path = server.files[parts[1]]
