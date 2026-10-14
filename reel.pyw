@@ -457,6 +457,7 @@ class Main(QMainWindow):
         self.cloud.shares.connect(self.browser.on_shares)
         self.wants = []                         # owner: what everyone has on their watchlist
         self.cloud.wants.connect(self.on_wants)
+        self.cloud.shares.connect(self.on_shares_inbox)
         self.cloud.revoked.connect(self.on_revoked)
         self.player.title_changed.connect(lambda t: setattr(self.cloud, 'now_playing', t))
         self.player.closed.connect(lambda: setattr(self.cloud, 'now_playing', ''))
@@ -809,6 +810,48 @@ class Main(QMainWindow):
                 self.show_library()
             self.browser.go(page)
 
+    # ------------------------------------------------------------ owner inbox
+    def is_owner(self):
+        return self.account()['id'] == 'owner'
+
+    def inbox(self):
+        return self.store.settings.data.setdefault('inbox', [])
+
+    def inbox_add(self, kind, text, ref=None, key=None, t=None, path=''):
+        """One message in the owner's Inbox (newest first, kept to 300)."""
+        if not self.is_owner():
+            return
+        box = self.inbox()
+        key = key or f'{kind}|{time.time()}'
+        if any(m.get('key') == key for m in box):
+            return
+        keep = ('id', 'from_account', 'from_name', 'kind', 'meta_id', 'name', 'year', 'poster', 'background', 'note')
+        box.append({'key': key, 'kind': kind, 'text': text, 't': t or time.time(), 'read': False, 'path': path,
+                    'ref': {k: ref.get(k) for k in keep} if ref else None})
+        box.sort(key=lambda m: -(m.get('t') or 0))
+        del box[300:]
+        self.store.settings.save()
+        self.browser.on_inbox()
+
+    def on_shares_inbox(self, rows):
+        """Recommendations sent to the owner also land in the Inbox."""
+        if not self.is_owner():
+            return
+        s = self.store.settings.data
+        seen = set(s.get('shares_seen', []))
+        new = [r for r in rows or [] if r['id'] not in seen]
+        if not new:
+            return
+        s['shares_seen'] = list(seen | {r['id'] for r in rows})[-3000:]
+        for r in new:
+            note = f': “{r["note"]}”' if r.get('note') else ''
+            self.inbox_add('share', f'{r.get("from_name") or "Someone"} recommended “{r.get("name")}”{note}',
+                           ref=r, key=f'share|{r["id"]}', t=r.get('t'))
+        if len(new) == 1:
+            self.notify('Recommendation', self.inbox()[0]['text'], 'inbox')
+        else:
+            self.notify('Recommendations', f'{len(new)} new recommendations', 'inbox')
+
     def want_row(self, cand):
         from cloud import slug
         me = self.account()
@@ -843,14 +886,17 @@ class Main(QMainWindow):
         if set(r['id'] for r in self.wants) - seen:
             s['wants_seen'] = list(seen | {r['id'] for r in self.wants})[-3000:]
             self.store.settings.save()
+        for r in new:
+            self.inbox_add('want', f'{r.get("from_name") or "Someone"} added “{r.get("name")}” to their watchlist',
+                           ref=r, key=r['id'], t=r.get('t'))
         if new:
             if len(new) == 1:
                 r = new[0]
                 self.notify('Watchlist', f'{r.get("from_name") or "Someone"} added “{r.get("name")}” to their watchlist',
-                            'discover')
+                            'inbox')
             else:
                 who = ', '.join(dict.fromkeys(r.get('from_name') or 'Someone' for r in new))
-                self.notify('Watchlist', f'{len(new)} new watchlist titles from {who}', 'discover')
+                self.notify('Watchlist', f'{len(new)} new watchlist titles from {who}', 'inbox')
         self.auto_download_wants()
         self.browser.on_wants()
 
@@ -861,33 +907,48 @@ class Main(QMainWindow):
             return
         done = set(s.get('auto_dl_seen', []))
         hidden = set(s.get('wants_hidden', []))
-        picked, why = [], {}
+        picked, why, per = [], {}, []
         for r in self.wants:
             if r['id'] in hidden:
                 continue
             owned, is_show = self.browser.owned_item({'name': r.get('name'), 'kind': r.get('kind')})
             if not owned:
                 continue
+            got = 0
             for it in (owned.episodes if is_show else [owned]):
                 sid = sync_id(it)
                 if it.remote and sid not in done:
                     done.add(sid)                  # once only: cancelling it sticks
                     picked.append(it)
+                    got += 1
                     who = r.get('from_name') if r.get('from_account') != 'owner' else 'your'
                     why[sid] = f'{who}’s watchlist' if who != 'your' else 'your watchlist'
+            if got:
+                per.append((r, got, is_show))
         if not picked:
             return
         s['auto_dl_seen'] = list(done)[-5000:]
         self.store.settings.save()
         self.download(picked, lambda it: why.get(sync_id(it), 'watchlist'))
+        for r, got, is_show in per:
+            whose = 'your watchlist' if r.get('from_account') == 'owner' else f'{r.get("from_name") or "someone"}’s watchlist'
+            what = f'{got} episode' + ('s' if got != 1 else '') + ' of ' if is_show else ''
+            self.inbox_add('download', f'Downloading {what}“{r.get("name")}” to this computer — {whose}',
+                           ref=r, key=f'dl|{r["id"]}|{time.time():.0f}')
         names = list(dict.fromkeys(self.browser.titles(i)[0] for i in picked))
         self.notify('Downloading from watchlists',
                     ', '.join(names[:3]) + (f' and {len(names) - 3} more' if len(names) > 3 else '') +
-                    ' — saving to this computer', 'downloads')
+                    ' — saving to this computer', 'inbox')
 
     def _on_downloaded(self, path):
         it = self._add_local(path)
         name = it.display if it else os.path.basename(path)
+        d = next((x for x in self.downloads.queue if x.get('path') == path), None)
+        if d and d.get('why'):
+            ref = next((r for r in self.wants if it and self.browser.owned_item(
+                {'name': r.get('name'), 'kind': r.get('kind')})[0] in (it, self.lib.show_of(it))), None)
+            self.inbox_add('downloaded', f'“{name}” is on this computer now — {d["why"]}', ref=ref,
+                           key=f'done|{d["id"]}', path=path)
         left = len(self.downloads.active())
         self.browser.set_cloud_status(f'Downloaded “{name}” — plays offline now.'
                                       + (f' {left} more in the queue.' if left else ''))

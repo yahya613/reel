@@ -594,7 +594,7 @@ class Browser(QWidget):
         self.nav = {}
         for key, icon, text in (('home', 'home', 'Home'), ('discover', 'sparkles', 'Discover'),
                                 ('movies', 'film', 'Movies'), ('shows', 'tv', 'TV Shows'),
-                                ('downloads', 'download', 'Downloads')):
+                                ('downloads', 'download', 'Downloads'), ('inbox', 'inbox', 'Inbox')):
             b = NavButton(icon, text)
             b.clicked.connect(lambda _=False, k=key: self.go(k))
             b.setStyleSheet('border:none')
@@ -939,13 +939,16 @@ class Browser(QWidget):
         self._dl_buttons = []
         self._page_entries = []
         self.nav['downloads'].setVisible(bool(self.main.cloud.on or self.main.downloads.queue))
+        self.nav['inbox'].setVisible(self.main.is_owner() and bool(self.main.cloud.on or self.main.inbox()))
+        self._inbox_badge()
         self.nav['movies'].count = str(len(self.movies())) if self.lib.items else ''
         acct = self.main.account()
         self.btn_account.setText(acct.get('name') or 'Owner')
         {'home': self.render_home, 'discover': self.render_discover, 'movies': self.render_movies,
          'shows': self.render_shows, 'show': self.render_show, 'movie': self.render_movie,
          'collection': self.render_collection, 'reco': self.render_reco, 'accounts': self.render_accounts,
-         'downloads': self.render_downloads, 'search': self.render_search}[page](arg, keep_scroll)
+         'downloads': self.render_downloads, 'inbox': self.render_inbox,
+         'search': self.render_search}[page](arg, keep_scroll)
 
     def _do_search(self):
         q = self.search.text().strip()
@@ -1643,6 +1646,103 @@ class Browser(QWidget):
         self.nav['discover'].count = str(n) if n else ''
         self.nav['discover'].update()
 
+    # ------------------------------------------------------------ owner inbox
+    def _inbox_badge(self):
+        n = sum(1 for m in self.main.inbox() if not m.get('read'))
+        self.nav['inbox'].count = str(n) if n else ''
+        self.nav['inbox'].update()
+
+    def on_inbox(self):
+        self.nav['inbox'].setVisible(self.main.is_owner())
+        self._inbox_badge()
+        if self.current[0] == 'inbox' and self.main.stack.currentWidget() is self:
+            self.render(keep_scroll=True)
+
+    def inbox_target(self, m):
+        """(library item or show, is_show, items) the message is about, if it's in the library."""
+        ref = m.get('ref') or {}
+        if m.get('path'):
+            it = self.main.local.find(m['path'])
+            if it:
+                show = self.lib.show_of(it) if it.kind == 'episode' else None
+                return (show, True, show.episodes) if show else (it, False, [it])
+        if not ref.get('name'):
+            return None, False, []
+        owned, is_show = self.owned_item({'name': ref.get('name'), 'kind': ref.get('kind')})
+        return owned, is_show, (owned.episodes if is_show else [owned]) if owned else []
+
+    def inbox_poster(self, m):
+        ref = m.get('ref') or {}
+        if ref.get('poster'):
+            return self.images.remote(ref['poster'])
+        owned, is_show, _ = self.inbox_target(m)
+        if not owned:
+            return None
+        meta = self.show_meta(owned) if is_show else self.movie_meta(owned)
+        return self.images.remote(meta.get('poster')) if meta.get('poster') else None
+
+    def inbox_status(self, m):
+        owned, is_show, items = self.inbox_target(m)
+        if not owned:
+            return 'Not in your library yet' if (m.get('ref') or {}).get('name') else ''
+        active, _, remote = self._dl_state(items)
+        if active:
+            return 'Downloading to this computer'
+        if not remote:
+            return 'On this computer'
+        return 'On your other computer' if len(remote) == len(items) else 'Partly on this computer'
+
+    def render_inbox(self, _, keep_scroll=False):
+        v = self.page.fresh(keep_scroll=keep_scroll)
+        self.pages.setCurrentWidget(self.page)
+        box = self.main.inbox()
+        unread = sum(1 for m in box if not m.get('read'))
+        w, h = section('Inbox', f'{unread} new' if unread else None, top=6)
+        if box:
+            cl = PillButton('Clear all', None, 'ghost', h=36, px=13.5)
+            cl.clicked.connect(self.clear_inbox)
+            h.addWidget(cl)
+        v.addWidget(w)
+        v.addWidget(label('What people add to their watchlists, what they recommend to you, and what Reel downloads '
+                          'for you because of it.', 13.5, MUTED, wrap=True, maxw=900))
+        v.addSpacing(4)
+        if not box:
+            v.addWidget(label('No messages yet. When someone adds a movie or show to their watchlist, it shows up here '
+                              '(and as a notification).', 15, MUTED, wrap=True, maxw=760))
+        day = None
+        for m in box:
+            d = day_label(m.get('t') or 0)
+            if d != day:
+                day = d
+                v.addWidget(label(d.upper(), 11.5, MUTED, HEAVY))
+            v.addWidget(InboxRow(self, m))
+        v.addStretch(1)
+        if unread:                     # seen now; the rows above keep their "new" look until you leave
+            for m in box:
+                m['read'] = True
+            self.store.settings.save()
+            self._inbox_badge()
+
+    def clear_inbox(self):
+        self.main.inbox().clear()
+        self.store.settings.save()
+        self.render()
+
+    def dismiss_message(self, m):
+        box = self.main.inbox()
+        if m in box:
+            box.remove(m)
+            self.store.settings.save()
+        self.render(keep_scroll=True)
+
+    def inbox_open(self, m):
+        ref = m.get('ref') or {}
+        owned, is_show, _ = self.inbox_target(m)
+        if owned:
+            return self.open_show(owned) if is_show else self.open_movie(owned)
+        if ref.get('name'):
+            self.open_share(ref)
+
     def recommend_to(self, payload):
         from reel import RecommendDialog
         me = self.main.account()['id']
@@ -2199,6 +2299,74 @@ class Browser(QWidget):
         self.scan_status.setText(text)
         self.scan_bar.set_active(active)
         self.btn_scan.setText('Stop scan' if active else 'Scan computer')
+
+
+def day_label(t):
+    if not t:
+        return 'Earlier'
+    lt, now = time.localtime(t), time.localtime()
+    days = (time.mktime(now[:3] + (0, 0, 0, 0, 0, -1)) - time.mktime(lt[:3] + (0, 0, 0, 0, 0, -1))) // 86400
+    return 'Today' if days <= 0 else 'Yesterday' if days == 1 else time.strftime('%A' if days < 7 else '%b %d', lt)
+
+
+def ago(t):
+    s = max(0, time.time() - (t or 0))
+    if s < 60:
+        return 'just now'
+    if s < 3600:
+        return f'{int(s // 60)} min ago'
+    if s < 86400:
+        return f'{int(s // 3600)} h ago'
+    return time.strftime('%b %d, %H:%M', time.localtime(t))
+
+
+class InboxRow(QFrame):
+    ICONS = {'want': 'bookmark', 'share': 'users', 'download': 'download', 'downloaded': 'check'}
+
+    def __init__(self, browser, m):
+        super().__init__()
+        new = not m.get('read')
+        self.setObjectName('ibrow')
+        self.setStyleSheet(f'#ibrow{{background:{SURFACE2 if new else SURFACE};border:1px solid '
+                           f'{"#2d3a5c" if new else BORDER};border-radius:14px}}')
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 12, 16, 12)
+        h.setSpacing(16)
+        ref = m.get('ref') or {}
+        h.addWidget(ImageBox(lambda: browser.inbox_poster(m), 52, 78, '',
+                             'tv' if ref.get('kind') == 'series' else 'film', 8))
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        col.addStretch(1)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        ic = QLabel()
+        ic.setPixmap(qicon(self.ICONS.get(m.get('kind'), 'inbox'), ACCENT2 if new else MUTED, 18).pixmap(18, 18))
+        ic.setStyleSheet('background:transparent;border:none')
+        top.addWidget(ic)
+        top.addWidget(label(m.get('text', ''), 15, TEXT, BOLD if new else NORMAL, wrap=True), 1)
+        col.addLayout(top)
+        bits = [ago(m.get('t')), browser.inbox_status(m)]
+        col.addWidget(label('  ·  '.join(b for b in bits if b), 12.5, MUTED))
+        col.addStretch(1)
+        h.addLayout(col, 1)
+        owned, is_show, items = browser.inbox_target(m)
+        if owned and not is_show and not owned.remote:
+            pb = PillButton('Play', 'play', 'light', h=38, px=13.5)
+            pb.clicked.connect(lambda: browser.play.emit(owned, None))
+            h.addWidget(pb)
+        elif owned and browser.todo_items(items):
+            db = PillButton('Download', 'download', 'ghost', h=38, px=13.5)
+            whose = 'your watchlist' if ref.get('from_account') == 'owner' else f'{ref.get("from_name") or "someone"}’s watchlist'
+            db.clicked.connect(lambda: (browser.main.download(items, lambda it: whose), browser.render(keep_scroll=True)))
+            h.addWidget(db)
+        if owned or ref.get('name'):
+            ob = PillButton('Open' if owned else 'Details', None, 'ghost', h=38, px=13.5)
+            ob.clicked.connect(lambda: browser.inbox_open(m))
+            h.addWidget(ob)
+        xb = IconButton('x', 38, 18, tip='Remove this message')
+        xb.clicked.connect(lambda: browser.dismiss_message(m))
+        h.addWidget(xb)
 
 
 def free_space(path):
