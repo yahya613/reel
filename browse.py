@@ -537,6 +537,7 @@ class Browser(QWidget):
         self.lib = main.lib
         self.sort = {'movies': 'added', 'shows': 'added'}
         self._coll_cache = None
+        self.account_rows = []
         self.season = {}
         self.history = []
         self.current = ('home', None)
@@ -587,6 +588,10 @@ class Browser(QWidget):
         sv.addSpacing(6)
         sv.addWidget(self.scan_bar)
         sv.addSpacing(8)
+        self.btn_account = PillButton('Owner', 'users', 'ghost', h=36, px=13)
+        self.btn_account.clicked.connect(self.account_tapped)
+        sv.addWidget(self.btn_account)
+        sv.addSpacing(6)
         srow = QHBoxLayout()
         srow.setSpacing(6)
         self.btn_scan = PillButton('Scan computer', 'refresh', 'primary', h=40, px=14)
@@ -876,9 +881,11 @@ class Browser(QWidget):
                          or (k == 'discover' and page == 'reco'))
         self.btn_back.setVisible(bool(self.history) and page not in ('home',))
         self.nav['movies'].count = str(len(self.movies())) if self.lib.items else ''
+        acct = self.main.account()
+        self.btn_account.setText(acct.get('name') or 'Owner')
         {'home': self.render_home, 'discover': self.render_discover, 'movies': self.render_movies,
          'shows': self.render_shows, 'show': self.render_show, 'movie': self.render_movie,
-         'collection': self.render_collection, 'reco': self.render_reco,
+         'collection': self.render_collection, 'reco': self.render_reco, 'accounts': self.render_accounts,
          'search': self.render_search}[page](arg, keep_scroll)
 
     def _do_search(self):
@@ -1340,6 +1347,127 @@ class Browser(QWidget):
         from PyQt6.QtCore import QUrl
         url = yt if str(yt).startswith('http') else f'https://www.youtube.com/watch?v={yt}'
         QDesktopServices.openUrl(QUrl(url))
+
+    # ------------------------------------------------------------ accounts
+    def account_tapped(self):
+        acct = self.main.account()
+        if acct.get('role') == 'owner':
+            self.go('accounts')
+        else:
+            m = QMenu(self)
+            m.setStyleSheet(MENU_CSS)
+            m.setFont(font(13.5))
+            m.addAction('Switch account', self.main.switch_account)
+            m.exec(self.btn_account.mapToGlobal(QPoint(0, -10)))
+
+    def on_accounts(self, rows):
+        self.account_rows = rows or []
+        if self.current[0] == 'accounts':
+            self.render(keep_scroll=True)
+
+    def render_accounts(self, _, keep_scroll=False):
+        v = self.page.fresh(keep_scroll=keep_scroll)
+        self.pages.setCurrentWidget(self.page)
+        if self.main.account().get('role') != 'owner':
+            v.addWidget(label('Only the owner can manage accounts.', 15, MUTED))
+            v.addStretch(1)
+            return
+        self.main.cloud.fetch_accounts()
+        w0, _h = section('People', top=6)
+        v.addWidget(w0)
+        v.addWidget(label('Everyone has their own watch history, library and recommendations. '
+                          'Add someone, then give them their name + PIN. Revoke to cut their access instantly.', 13.5, MUTED))
+        v.addSpacing(6)
+        add = PillButton('Add account', 'plus', 'primary', h=40, px=14)
+        add.clicked.connect(self.add_account)
+        v.addWidget(add, 0, Qt.AlignmentFlag.AlignLeft)
+        v.addSpacing(6)
+        rows = sorted(self.account_rows, key=lambda a: (a.get('role') != 'owner', (a.get('name') or '').lower()))
+        if not rows:
+            v.addWidget(label('Loading…', 14, MUTED))
+        for a in rows:
+            v.addWidget(self.account_row(a))
+        v.addStretch(1)
+
+    def account_row(self, a):
+        import time as _t
+        card = QFrame()
+        online = a.get('last_seen') and (_t.time() - a['last_seen'] < 90)
+        revoked = a.get('active') is False
+        card.setStyleSheet(f'QFrame{{background:{SURFACE}; border:1px solid {BORDER}; border-radius:12px}}')
+        h = QHBoxLayout(card)
+        h.setContentsMargins(16, 12, 12, 12)
+        h.setSpacing(12)
+        dot = QLabel('●')
+        dot.setStyleSheet(f'color:{"#54d98c" if online else "#555"};background:transparent;border:none;font-size:13px')
+        h.addWidget(dot, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        name = (a.get('name') or a['id']) + ('  ·  owner' if a.get('role') == 'owner' else '')
+        nl = label(name + ('   (revoked)' if revoked else ''), 16, '#8c8c9b' if revoked else TEXT, BOLD)
+        nl.setStyleSheet(f'color:{"#8c8c9b" if revoked else TEXT};background:transparent;border:none')
+        col.addWidget(nl)
+        if online and a.get('now_playing'):
+            sub = f'Watching {a["now_playing"]}'
+        elif online:
+            sub = 'Online'
+        elif a.get('last_seen'):
+            mins = int((_t.time() - a['last_seen']) / 60)
+            sub = 'Last seen ' + ('just now' if mins < 1 else f'{mins} min ago' if mins < 60 else
+                                  f'{mins // 60} h ago' if mins < 1440 else f'{mins // 1440} d ago')
+        else:
+            sub = 'Never signed in'
+        s = label(sub + (f'   ·   on {a["device"]}' if a.get('device') and online else ''), 13, MUTED)
+        s.setStyleSheet(f'color:{MUTED};background:transparent;border:none')
+        col.addWidget(s)
+        h.addLayout(col, 1)
+        if a.get('role') != 'owner':
+            if revoked:
+                rb = PillButton('Restore', None, 'ghost', h=34, px=13)
+                rb.clicked.connect(lambda _=0, a=a: self.set_active(a, True))
+                h.addWidget(rb)
+            else:
+                kb = PillButton('Revoke', 'power', 'ghost', h=34, px=13)
+                kb.clicked.connect(lambda _=0, a=a: self.set_active(a, False))
+                h.addWidget(kb)
+            xb = IconButton('x', 34, 16, tip='Delete account')
+            xb.clicked.connect(lambda _=0, a=a: self.remove_account(a))
+            h.addWidget(xb)
+        return card
+
+    def add_account(self):
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit as QLE
+        name, ok = QInputDialog.getText(self, 'Add account', 'Name:')
+        if not (ok and name.strip()):
+            return
+        pin, ok = QInputDialog.getText(self, 'Add account', f'PIN for {name.strip()} (4+ digits):', QLE.EchoMode.Normal)
+        if not (ok and len(pin.strip()) >= 4):
+            if ok:
+                self.set_cloud_status('PIN must be at least 4 digits.')
+            return
+        import time as _t
+        from cloud import slug
+        aid = slug(name)
+        if aid in ('owner',) or any(a['id'] == aid for a in self.account_rows):
+            aid = aid + '-' + str(int(_t.time()) % 1000)
+        self.main.cloud.save_account({'id': aid, 'name': name.strip(), 'pin': pin.strip(), 'role': 'member',
+                                      'active': True, 't': _t.time()})
+        self.set_cloud_status(f'Added {name.strip()} — PIN {pin.strip()}')
+        QTimer.singleShot(900, lambda: self.render(keep_scroll=True))
+
+    def set_active(self, a, active):
+        row = {'id': a['id'], 'active': active}
+        self.main.cloud.save_account(row)
+        a['active'] = active
+        self.render(keep_scroll=True)
+
+    def remove_account(self, a):
+        from PyQt6.QtWidgets import QMessageBox
+        if QMessageBox.question(self, 'Delete account',
+                                f'Delete {a.get("name") or a["id"]} and all their watch data?') == QMessageBox.StandardButton.Yes:
+            self.main.cloud.delete_account(a['id'])
+            self.account_rows = [x for x in self.account_rows if x['id'] != a['id']]
+            self.render(keep_scroll=True)
 
     def open_movie(self, it):
         self.go('movie', it)

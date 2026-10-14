@@ -4,12 +4,16 @@ Progress is keyed by *what* you watched, not where the file lives, so a show you
 resumes at the same spot on the Mac. Videos never go to the cloud (they're far too big for it):
 each Reel shares its own files (server.py) and the cloud just tells the other computers where to find them.
 """
-import json, socket, threading, time, urllib.request, urllib.error, urllib.parse
+import json, re, socket, threading, time, urllib.request, urllib.error, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from library import norm_key
 
 DEVICE = socket.gethostname()
+
+
+def slug(name):
+    return re.sub(r'[^a-z0-9]+', '-', (name or '').lower()).strip('-')[:40] or 'user'
 
 
 def sync_id(item):
@@ -30,6 +34,8 @@ def ping(base, token):
 class Cloud(QObject):
     status = pyqtSignal(str)
     synced = pyqtSignal(object, object)  # progress rows, [remote device dicts]
+    accounts = pyqtSignal(object)        # [account rows] for the control panel
+    revoked = pyqtSignal()               # the owner turned this account off
 
     def __init__(self, store):
         super().__init__()
@@ -37,6 +43,7 @@ class Cloud(QObject):
         self.dirty = {}
         self.lock = threading.Lock()
         self.busy = False
+        self.now_playing = ''
         self.timer = QTimer(self, interval=15000, timeout=self.flush)
         self.timer.start()
 
@@ -49,6 +56,71 @@ class Cloud(QObject):
     def on(self):
         url, key = self.cfg
         return bool(url and key)
+
+    @property
+    def account(self):
+        return (self.store.settings.data.get('account') or {}).get('id', 'owner')
+
+    @property
+    def is_owner(self):
+        return (self.store.settings.data.get('account') or {}).get('role', 'owner') == 'owner'
+
+    # -- accounts -----------------------------------------------------------------
+    def fetch_accounts(self):
+        """Load the account list (for the control panel / sign-in) and emit `accounts`."""
+        if not self.on:
+            return
+
+        def run():
+            try:
+                rows = self._req('GET', 'reel_accounts?select=*&order=role.desc,name.asc') or []
+                self.accounts.emit(rows)
+            except Exception:
+                self.accounts.emit(None)
+        threading.Thread(target=run, daemon=True).start()
+
+    def accounts_sync(self):
+        try:
+            return self._req('GET', 'reel_accounts?select=*&order=role.desc,name.asc') or []
+        except Exception:
+            return []
+
+    def save_account(self, row, cb=None):
+        def run():
+            ok = True
+            try:
+                self._req('POST', 'reel_accounts', [row], 'resolution=merge-duplicates')
+            except Exception:
+                ok = False
+            if cb:
+                cb(ok)
+            self.fetch_accounts()
+        threading.Thread(target=run, daemon=True).start()
+
+    def delete_account(self, aid):
+        def run():
+            try:
+                self._req('DELETE', f'reel_accounts?id=eq.{urllib.parse.quote(aid)}')
+                self._req('DELETE', f'reel_progress?account=eq.{urllib.parse.quote(aid)}')
+                self._req('DELETE', f'reel_library?account=eq.{urllib.parse.quote(aid)}')
+            except Exception:
+                pass
+            self.fetch_accounts()
+        threading.Thread(target=run, daemon=True).start()
+
+    def heartbeat(self):
+        """Keep this account's presence fresh and check it hasn't been revoked. Returns active?"""
+        aid = self.account
+        try:
+            self._req('POST', 'reel_accounts', [{'id': aid, 'device': DEVICE, 'now_playing': self.now_playing,
+                                                 'last_seen': time.time()}], 'resolution=merge-duplicates')
+            rows = self._req('GET', f'reel_accounts?id=eq.{urllib.parse.quote(aid)}&select=active') or []
+            if rows and rows[0].get('active') is False:
+                self.revoked.emit()
+                return False
+        except Exception:
+            pass
+        return True
 
     def _req(self, method, path, body=None, prefer=None):
         url, key = self.cfg
@@ -84,10 +156,11 @@ class Cloud(QObject):
             return
         with self.lock:
             items, self.dirty = list(self.dirty.values()), {}
+        acct = self.account
         rows = {}
         for it in items:
             rec = self.store.get(it)
-            rows[sync_id(it)] = {'id': sync_id(it), 'title': it.display, 'pos': rec.get('pos', 0),
+            rows[sync_id(it)] = {'id': sync_id(it), 'account': acct, 'title': it.display, 'pos': rec.get('pos', 0),
                                  'dur': rec.get('dur', 0), 'watched': bool(rec.get('watched')),
                                  't': rec.get('t', time.time()), 'device': DEVICE}
         rows = list(rows.values())
@@ -123,13 +196,14 @@ class Cloud(QObject):
     def push_library(self, items, server_info):
         if not self.on:
             return
-        rows = [{'id': f'{DEVICE}:{it.key}', 'device': DEVICE, 'kind': it.kind, 'title': it.title, 'year': it.year,
-                 'season': it.season, 'episode': it.episode, 'path': it.path, 'size': it.size, 'added': it.added,
-                 'sync_id': sync_id(it)} for it in items if not it.remote and it.kind in ('movie', 'episode')]
+        acct = self.account
+        rows = [{'id': f'{DEVICE}:{it.key}', 'account': acct, 'device': DEVICE, 'kind': it.kind, 'title': it.title,
+                 'year': it.year, 'season': it.season, 'episode': it.episode, 'path': it.path, 'size': it.size,
+                 'added': it.added, 'sync_id': sync_id(it)} for it in items if not it.remote and it.kind in ('movie', 'episode')]
         if server_info:
-            rows.append({'id': f'{DEVICE}:__server__', 'device': DEVICE, 'kind': 'server', 'title': server_info['token'],
-                         'year': 0, 'season': 0, 'episode': 0, 'path': json.dumps(server_info),
-                         'size': server_info['port'], 'added': time.time(), 'sync_id': ''})
+            rows.append({'id': f'{DEVICE}:__server__', 'account': acct, 'device': DEVICE, 'kind': 'server',
+                         'title': server_info['token'], 'year': 0, 'season': 0, 'episode': 0,
+                         'path': json.dumps(server_info), 'size': server_info['port'], 'added': time.time(), 'sync_id': ''})
 
         def run():
             self._req('DELETE', f'reel_library?device=eq.{urllib.parse.quote(DEVICE)}')
@@ -146,8 +220,11 @@ class Cloud(QObject):
 
         def run():
             try:
-                progress = self._req('GET', 'reel_progress?select=*&limit=50000') or []
-                rows = self._req('GET', f'reel_library?select=*&device=neq.{urllib.parse.quote(DEVICE)}&limit=50000') or []
+                self.heartbeat()                       # presence + revoke check
+                acct = urllib.parse.quote(self.account)
+                progress = self._req('GET', f'reel_progress?select=*&account=eq.{acct}&limit=50000') or []
+                rows = self._req('GET', f'reel_library?select=*&account=eq.{acct}&device=neq.'
+                                 f'{urllib.parse.quote(DEVICE)}&limit=50000') or []
                 servers = {r['device']: json.loads(r['path']) for r in rows if r.get('kind') == 'server'}
                 remotes = []
 

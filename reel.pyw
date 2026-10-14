@@ -206,6 +206,96 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+class AccountDialog(QDialog):
+    """Sign in to an account (separate watch state / library per person). Owner sets up first."""
+    def __init__(self, main, accounts):
+        super().__init__(main)
+        self.main, self.accounts = main, accounts or []
+        self.picked = None
+        self.setWindowTitle('Who’s watching?')
+        self.setMinimumWidth(460)
+        self.setModal(True)
+        self.setStyleSheet(
+            f'QDialog{{background:{SURFACE}}} QLabel{{color:{TEXT};background:transparent}}'
+            f'QLineEdit{{background:#101016;color:{TEXT};border:1px solid {BORDER};border-radius:8px;padding:9px 11px;font-size:15px}}')
+        v = QVBoxLayout(self)
+        v.setContentsMargins(28, 24, 28, 22)
+        v.setSpacing(12)
+        self.has_owner = any(a.get('role') == 'owner' for a in self.accounts)
+        if not self.has_owner:
+            v.addWidget(label('Set up Reel', 23, TEXT, HEAVY))
+            v.addWidget(label('This becomes the owner account. You manage everyone else from here, and you '
+                              'can sign your other devices in with the same name + PIN.', 13, MUTED, wrap=True))
+            self.name = QLineEdit(placeholderText='Your name')
+            self.pin = QLineEdit(placeholderText='Choose a PIN (4+ digits)')
+            self.pin.setEchoMode(QLineEdit.EchoMode.Password)
+            v.addWidget(self.name)
+            v.addWidget(self.pin)
+            self.msg = label('', 13, '#ff8080')
+            v.addWidget(self.msg)
+            b = PillButton('Create owner account', None, 'primary', h=42, px=14.5)
+            b.clicked.connect(self.create_owner)
+            v.addWidget(b, 0, Qt.AlignmentFlag.AlignRight)
+        else:
+            v.addWidget(label('Who’s watching?', 23, TEXT, HEAVY))
+            v.addWidget(label('Pick your account and enter your PIN. The owner creates accounts in the '
+                              'control panel.', 13, MUTED, wrap=True))
+            self.box = QVBoxLayout()
+            self.box.setSpacing(6)
+            for a in self.accounts:
+                if a.get('active') is False:
+                    continue
+                r = PillButton(f'{a.get("name") or a["id"]}' + ('  (owner)' if a.get('role') == 'owner' else ''),
+                               'check', 'outline', h=44, px=15)
+                r.clicked.connect(lambda _=0, a=a: self.choose(a))
+                self.box.addWidget(r)
+            v.addLayout(self.box)
+            self.pin = QLineEdit(placeholderText='PIN')
+            self.pin.setEchoMode(QLineEdit.EchoMode.Password)
+            self.pin.returnPressed.connect(self.enter_pin)
+            self.pin.hide()
+            v.addWidget(self.pin)
+            self.msg = label('', 13, '#ff8080')
+            v.addWidget(self.msg)
+        self._sel = None
+
+    def _save_local(self, aid, name, role, pin):
+        self.main.store.settings.data['account'] = {'id': aid, 'name': name, 'role': role, 'pin': pin}
+        self.main.store.settings.save()
+
+    def create_owner(self):
+        import time as _t
+        name = self.name.text().strip()
+        pin = self.pin.text().strip()
+        if len(name) < 1 or len(pin) < 4:
+            self.msg.setText('Enter a name and a PIN of at least 4 digits.')
+            return
+        from cloud import slug
+        row = {'id': 'owner', 'name': name, 'pin': pin, 'role': 'owner', 'active': True,
+               'device': __import__('socket').gethostname(), 'last_seen': _t.time(), 't': _t.time()}
+        self.main.cloud.save_account(row)
+        self._save_local('owner', name, 'owner', pin)
+        self.picked = row
+        self.accept()
+
+    def choose(self, a):
+        self._sel = a
+        self.pin.show()
+        self.pin.setFocus()
+        self.msg.setText(f'Enter {a.get("name") or a["id"]}’s PIN')
+
+    def enter_pin(self):
+        a = self._sel
+        if not a:
+            return
+        if str(self.pin.text().strip()) != str(a.get('pin') or ''):
+            self.msg.setText('Wrong PIN.')
+            return
+        self._save_local(a['id'], a.get('name') or a['id'], a.get('role', 'member'), a.get('pin'))
+        self.picked = a
+        self.accept()
+
+
 class Main(QMainWindow):
     tunnel_changed = pyqtSignal()
     scan_progress = pyqtSignal(int, int, str)
@@ -256,11 +346,17 @@ class Main(QMainWindow):
         self.catalog.ready.connect(self.browser.on_catalog_ready)
         self.cloud.status.connect(self.browser.set_cloud_status)
         self.cloud.synced.connect(self._on_synced)
+        self.cloud.accounts.connect(self.browser.on_accounts)
+        self.cloud.revoked.connect(self.on_revoked)
+        self.player.title_changed.connect(lambda t: setattr(self.cloud, 'now_playing', t))
+        self.player.closed.connect(lambda: setattr(self.cloud, 'now_playing', ''))
         self.servers = []                       # reachable other computers {name, base, token}
         self.server.on_upload = self.uploaded.emit
         self.uploaded.connect(self._on_uploaded)
         self.upload_status.connect(self.browser.set_cloud_status)
         self._uploading = False
+        self._revoked = False
+        self.ensure_account()
         self.update_status()
         self.cloud.push_library(self.local.items, self.server.info())  # also pulls when done
         self._addrs = (self.server.info() or {}).get('urls')
@@ -282,6 +378,56 @@ class Main(QMainWindow):
             if os.path.isfile(f):
                 QTimer.singleShot(200, lambda f=f: self.play_path(f))
                 break
+
+    # ------------------------------------------------------------ accounts
+    def account(self):
+        return self.store.settings.data.get('account') or {'id': 'owner', 'name': 'Owner', 'role': 'owner'}
+
+    def ensure_account(self):
+        """Make sure this device is signed into an account before syncing (only when cloud is on)."""
+        if os.environ.get('REEL_SCRIPT'):       # automated run: skip the interactive sign-in
+            return
+        if not self.cloud.on:
+            self.store.settings.data.setdefault('account', {'id': 'owner', 'name': 'Owner', 'role': 'owner'})
+            return
+        if self.store.settings.data.get('account'):
+            return
+        accounts = self.cloud.accounts_sync()
+        dlg = AccountDialog(self, accounts)
+        dlg.exec()
+        if not self.store.settings.data.get('account'):
+            # cancelled: default to owner only if nobody else has claimed it
+            if not any(a.get('role') == 'owner' for a in accounts):
+                self.store.settings.data['account'] = {'id': 'owner', 'name': 'Owner', 'role': 'owner'}
+                self.store.settings.save()
+            else:
+                QTimer.singleShot(0, self.close)   # a member who didn't sign in can't use it
+
+    def on_revoked(self):
+        if self._revoked:
+            return
+        self._revoked = True
+        self.sync_timer.stop()
+        self.store.settings.data.pop('account', None)
+        self.store.settings.save()
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(self, 'Access removed',
+                            'The owner has turned off this account. Reel is now locked on this device.')
+        self.quit_app()
+
+    def switch_account(self):
+        """Sign out: clear this account's cached watch data and ask who's watching again."""
+        for k in ('account', 'watchlist', 'reco_hidden'):
+            self.store.settings.data.pop(k, None)
+        self.store.progress.data.clear()
+        self.store.settings.save()
+        self.store.progress.save()
+        self.ensure_account()
+        if self.store.settings.data.get('account'):
+            self.store.progress.data.clear()
+            self.cloud.sync()
+            self.browser.refresh()
+            self.browser.render()
 
     # ------------------------------------------------------------ helpers used by views
     def titles(self, it):

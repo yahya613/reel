@@ -67,6 +67,9 @@ ICONS = {
     'plus-circle': '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>',
     'bookmark': '<path d="M6.5 3.5h11a1 1 0 0 1 1 1V21l-6.5-4-6.5 4V4.5a1 1 0 0 1 1-1z"/>',
     'play-o': '<circle cx="12" cy="12" r="9"/><path d="M10 8.5l5 3.5-5 3.5z" fill="currentColor" stroke="none"/>',
+    'users': '<circle cx="9" cy="8" r="3.4"/><path d="M3.5 19.5a5.5 5.5 0 0 1 11 0"/>'
+             '<path d="M16 5.2a3.4 3.4 0 0 1 0 6.1"/><path d="M17.5 14.2a5.5 5.5 0 0 1 3 4.8"/>',
+    'power': '<path d="M12 4v8"/><path d="M7.5 7a7 7 0 1 0 9 0"/>',
 }
 _cache = {}
 
