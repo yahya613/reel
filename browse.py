@@ -1703,8 +1703,8 @@ class Browser(QWidget):
         iv.setContentsMargins(40, 0, 40, 0)
         iv.addWidget(section('File', top=0)[0])
         if it.remote:
-            iv.addWidget(label(f'On {it.remote}  ·  {fmt_size(it.size)}  ·  streams from there, or press Download '
-                               f'to keep a copy on this computer', 13, MUTED, wrap=True))
+            iv.addWidget(label(f'In your library  ·  {fmt_size(it.size)}  ·  streams to this computer, or press '
+                               f'Download to keep a copy here', 13, MUTED, wrap=True))
         else:
             iv.addWidget(label(f'{it.path}\n{fmt_size(it.size)}', 13, MUTED, wrap=True))
             sf = PillButton('Show in folder', 'folder', 'ghost', h=36, px=13)
@@ -2055,8 +2055,6 @@ class Browser(QWidget):
             if d['id'] not in dl.items:
                 return f'Waiting for {d.get("from") or "your other computer"} to come online  ·  {fmt_size(size)}'
             t = 'Queued' + (f'  ·  {int(got * 100 / size)}% done' if got and size else '') + f'  ·  {fmt_size(size)}'
-            if d.get('from'):
-                t += f'  ·  from {d["from"]}'
             return t + (f'  ·  {d["error"]}' if d.get('error') else '')
         if st == 'failed':
             return f'Failed — {d.get("error") or "unknown error"}'
