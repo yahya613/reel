@@ -455,6 +455,8 @@ class Main(QMainWindow):
         self.cloud.synced.connect(self._on_synced)
         self.cloud.accounts.connect(self.browser.on_accounts)
         self.cloud.shares.connect(self.browser.on_shares)
+        self.wants = []                         # owner: what everyone has on their watchlist
+        self.cloud.wants.connect(self.on_wants)
         self.cloud.revoked.connect(self.on_revoked)
         self.player.title_changed.connect(lambda t: setattr(self.cloud, 'now_playing', t))
         self.player.closed.connect(lambda: setattr(self.cloud, 'now_playing', ''))
@@ -482,6 +484,9 @@ class Main(QMainWindow):
         self.tray.setContextMenu(menu)
         self._tray_menu = menu
         self.tray.activated.connect(lambda r: self.bring_back() if r != QSystemTrayIcon.ActivationReason.Context else None)
+        self._notify_page = None
+        self.tray.messageClicked.connect(self._notify_clicked)
+        QTimer.singleShot(4000, self.push_watchlist)
         if not self.lib.items and not self.store.settings.data.get('last_scan'):
             QTimer.singleShot(400, self.start_scan)  # first run: go find stuff right away
         for f in files:
@@ -666,6 +671,7 @@ class Main(QMainWindow):
         self.downloads.set_remote(items)   # fresh links (they change); resumes anything waiting for that computer
         if changed_lib:
             self.merge()
+            QTimer.singleShot(0, self.auto_download_wants)
         if self.cloud.apply_progress(self.lib.items, progress) or changed_lib:
             if self.stack.currentWidget() is self.browser:
                 self.browser.render(keep_scroll=True)
@@ -771,17 +777,113 @@ class Main(QMainWindow):
         return it
 
     # ------------------------------------------------------------ download from your other computers
-    def download(self, items):
+    def download(self, items, why=None):
         items = [i for i in items if i.remote]
         if not items:
             return
-        n = self.downloads.add(items, lambda it: self.browser.movie_title(it) if it.kind == 'movie' else it.display)
+        n = self.downloads.add(items, lambda it: self.browser.movie_title(it) if it.kind == 'movie' else it.display, why)
         left = len(self.downloads.active())
         if n:
             self.browser.set_cloud_status(f'Queued {n} to download · {left} in the queue. '
                                           'They save to this computer in the background.')
         else:
             self.browser.set_cloud_status('Already in your downloads.')
+
+    # ------------------------------------------------------------ watchlists -> the owner
+    def notify(self, title, msg, page=None):
+        """A real system notification (tray balloon / macOS notification), even while the window is open."""
+        self.browser.set_cloud_status(msg)
+        self._notify_page = page
+        was = self.tray.isVisible()
+        self.tray.show()
+        self.tray.showMessage(title, msg, QIcon(app_icon(64)), 10000)
+        if not was:
+            QTimer.singleShot(12000, lambda: self.tray.hide() if self.isVisible() else None)
+        QApplication.alert(self, 0)
+
+    def _notify_clicked(self):
+        page, self._notify_page = self._notify_page, None
+        self.bring_back()
+        if page:
+            if self.stack.currentWidget() is not self.browser:
+                self.show_library()
+            self.browser.go(page)
+
+    def want_row(self, cand):
+        from cloud import slug
+        me = self.account()
+        key = cand.get('id') or slug(cand.get('name', ''))
+        return {'id': f'owner|{me["id"]}|{key}|want', 'to_account': 'owner', 'from_account': me['id'],
+                'from_name': me.get('name') or 'Someone', 'kind': cand.get('kind') or 'movie',
+                'meta_id': cand.get('id') or '', 'name': cand.get('name') or '', 'year': str(cand.get('year') or '')[:9],
+                'poster': cand.get('poster') or '', 'background': cand.get('background') or '', 'note': '',
+                'status': 'want', 't': time.time()}
+
+    def watchlist_changed(self, cand, added):
+        if not self.cloud.on:
+            return
+        row = self.want_row(cand)
+        if added:
+            self.cloud.send_shares([row])
+        else:
+            self.cloud.dismiss_share(row['id'])
+
+    def push_watchlist(self):
+        """Tell the owner about everything already on this account's watchlist (idempotent upsert)."""
+        wl = self.store.settings.data.get('watchlist') or []
+        if self.cloud.on and wl and self.store.settings.data.get('account'):
+            self.cloud.send_shares([self.want_row(c) for c in wl])
+
+    def on_wants(self, rows):
+        self.wants = rows or []
+        s = self.store.settings.data
+        seen = set(s.get('wants_seen', []))
+        me = self.account()['id']
+        new = [r for r in self.wants if r['id'] not in seen and r.get('from_account') != me]
+        if set(r['id'] for r in self.wants) - seen:
+            s['wants_seen'] = list(seen | {r['id'] for r in self.wants})[-3000:]
+            self.store.settings.save()
+        if new:
+            if len(new) == 1:
+                r = new[0]
+                self.notify('Watchlist', f'{r.get("from_name") or "Someone"} added “{r.get("name")}” to their watchlist',
+                            'discover')
+            else:
+                who = ', '.join(dict.fromkeys(r.get('from_name') or 'Someone' for r in new))
+                self.notify('Watchlist', f'{len(new)} new watchlist titles from {who}', 'discover')
+        self.auto_download_wants()
+        self.browser.on_wants()
+
+    def auto_download_wants(self):
+        """Owner apps: anything on anyone's watchlist that's on one of your computers gets downloaded here."""
+        s = self.store.settings.data
+        if self.account()['id'] != 'owner' or not s.get('auto_dl_watchlist', True) or not self.remote_items:
+            return
+        done = set(s.get('auto_dl_seen', []))
+        hidden = set(s.get('wants_hidden', []))
+        picked, why = [], {}
+        for r in self.wants:
+            if r['id'] in hidden:
+                continue
+            owned, is_show = self.browser.owned_item({'name': r.get('name'), 'kind': r.get('kind')})
+            if not owned:
+                continue
+            for it in (owned.episodes if is_show else [owned]):
+                sid = sync_id(it)
+                if it.remote and sid not in done:
+                    done.add(sid)                  # once only: cancelling it sticks
+                    picked.append(it)
+                    who = r.get('from_name') if r.get('from_account') != 'owner' else 'your'
+                    why[sid] = f'{who}’s watchlist' if who != 'your' else 'your watchlist'
+        if not picked:
+            return
+        s['auto_dl_seen'] = list(done)[-5000:]
+        self.store.settings.save()
+        self.download(picked, lambda it: why.get(sync_id(it), 'watchlist'))
+        names = list(dict.fromkeys(self.browser.titles(i)[0] for i in picked))
+        self.notify('Downloading from watchlists',
+                    ', '.join(names[:3]) + (f' and {len(names) - 3} more' if len(names) > 3 else '') +
+                    ' — saving to this computer', 'downloads')
 
     def _on_downloaded(self, path):
         it = self._add_local(path)

@@ -64,8 +64,8 @@ class Downloads(QObject):
         self.kick()
         self.changed.emit()
 
-    def add(self, items, name_of=None):
-        """Queue remote titles. Returns how many were newly queued."""
+    def add(self, items, name_of=None, why=None):
+        """Queue remote titles. Returns how many were newly queued. why(item) -> short reason shown in the list."""
         n = 0
         for it in items:
             if not it.remote or it.kind not in ('movie', 'episode'):
@@ -80,7 +80,8 @@ class Downloads(QObject):
             self.queue.append({'id': sync_id(it), 'name': title, 'kind': it.kind,
                                'show': it.title if it.kind == 'episode' else '',
                                'file': remote_basename(it.path), 'size': it.size or 0, 'got': 0,
-                               'state': 'queued', 'from': it.remote, 'error': '', 'tries': 0, 'added': time.time()})
+                               'state': 'queued', 'from': it.remote, 'error': '', 'tries': 0, 'added': time.time(),
+                               'why': why(it) if why else ''})
             n += 1
         if n:
             self.save()

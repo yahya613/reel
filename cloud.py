@@ -37,6 +37,7 @@ class Cloud(QObject):
     accounts = pyqtSignal(object)        # [account rows] for the control panel
     revoked = pyqtSignal()               # the owner turned this account off
     shares = pyqtSignal(object)          # [recommendation rows] someone sent to this account
+    wants = pyqtSignal(object)           # owner only: [watchlist rows from every account]
 
     def __init__(self, store):
         super().__init__()
@@ -248,6 +249,13 @@ class Cloud(QObject):
                                                f'&status=eq.sent&order=t.desc&limit=200') or [])
                 except Exception:
                     pass
+                wants = None
+                if self.account == 'owner':            # everyone's watchlists come to the owner
+                    try:
+                        wants = self._req('GET', 'reel_shares?select=*&to_account=eq.owner&status=eq.want'
+                                                 '&order=t.desc&limit=500') or []
+                    except Exception:
+                        pass
                 progress = self._req('GET', f'reel_progress?select=*&account=eq.{acct}&limit=50000') or []
                 rows = self._req('GET', f'reel_library?select=*&account=eq.{acct}&device=neq.'
                                  f'{urllib.parse.quote(DEVICE)}&limit=50000') or []
@@ -266,6 +274,8 @@ class Cloud(QObject):
                     with ThreadPoolExecutor(len(servers)) as ex:
                         remotes = list(ex.map(probe, servers))
                 self.synced.emit(progress, remotes)
+                if wants is not None:                  # after synced, so remote titles are known
+                    self.wants.emit(wants)
                 online = [r['device'].removesuffix('.local') + (' (internet)' if r['base'].startswith('https') else '')
                           for r in remotes if r['base']]
                 offline = [r['device'] for r in remotes if not r['base']]

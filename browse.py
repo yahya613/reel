@@ -1260,12 +1260,16 @@ class Browser(QWidget):
     def toggle_watchlist(self, cand):
         wl = self.watchlist()
         cid = cand.get('id')
-        if self.in_watchlist(cid):
+        added = not self.in_watchlist(cid)
+        if not added:
             wl[:] = [w for w in wl if w.get('id') != cid]
         else:
             wl.insert(0, {k: cand.get(k) for k in ('id', 'kind', 'name', 'year', 'poster', 'background',
                                                    'rating', 'genres', 'description')})
         self.store.settings.save()
+        self.main.watchlist_changed(cand, added)
+        if added and self.main.cloud.on and self.main.account()['id'] != 'owner':
+            self.set_cloud_status('Added to your watchlist — the owner gets a heads-up.')
 
     def owned_item(self, cand):
         """If a recommended title is already in your library, return (item_or_show, is_show)."""
@@ -1328,6 +1332,11 @@ class Browser(QWidget):
         v.addWidget(label('Suggestions based on what you watch. Add things to your watchlist — '
                           'anything you get later shows up in your library automatically.', 13.5, MUTED))
         v.addSpacing(4)
+        reqs = self.want_requests()
+        if reqs:
+            who = ', '.join(dict.fromkeys(r.get('from_name') or 'Someone' for r in reqs))
+            v.addWidget(section('Watchlist requests', f'from {who}')[0])
+            v.addWidget(Grid([self.want_card(r) for r in reqs], 170, max_rows=1))
         if self.shares_rows:
             senders = ', '.join(dict.fromkeys(s.get('from_name', '') for s in self.shares_rows))
             v.addWidget(section('Recommended to You', f'from {senders}' if senders else '')[0])
@@ -1578,6 +1587,61 @@ class Browser(QWidget):
         self.shares_rows = rows or []
         if {s['id'] for s in self.shares_rows} != before and self.current[0] in ('discover', 'home'):
             self.render(keep_scroll=True)
+
+    def want_requests(self):
+        """Owner: titles other people put on their watchlists (newest first, one card per title)."""
+        if self.main.account()['id'] != 'owner':
+            return []
+        hidden = set(self.store.settings.data.get('wants_hidden', []))
+        out, seen = [], set()
+        for r in getattr(self.main, 'wants', []):
+            k = r.get('meta_id') or norm_key(r.get('name', ''))
+            if r.get('from_account') == 'owner' or r['id'] in hidden or k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
+        return out
+
+    def want_card(self, r):
+        def resolve():
+            owned, is_show = self.owned_item({'name': r.get('name'), 'kind': r.get('kind')})
+            items = (owned.episodes if is_show else [owned]) if owned else []
+            active, _, remote = self._dl_state(items)
+            badge = ('DOWNLOADING' if active else 'IN LIBRARY' if owned and not remote else
+                     'ON YOUR OTHER COMPUTER' if owned else 'WANTED')
+            return {'title': r.get('name', ''), 'sub': f'{r.get("from_name") or "Someone"} wants this',
+                    'pix': self.images.remote(r.get('poster')) if r.get('poster') else None,
+                    'icon': 'tv' if r.get('kind') == 'series' else 'film', 'badge': badge}
+        return Card('poster', resolve, lambda: self.open_share(r), lambda pos: self.want_menu(r, pos))
+
+    def want_menu(self, r, pos):
+        m = QMenu(self)
+        m.setStyleSheet(MENU_CSS)
+        m.setFont(font(13.5))
+        owned, is_show = self.owned_item({'name': r.get('name'), 'kind': r.get('kind')})
+        if owned:
+            m.addAction('Open' if is_show else 'Play',
+                        lambda: self.open_show(owned) if is_show else self.play.emit(owned, None))
+            items = owned.episodes if is_show else [owned]
+            if self.todo_items(items):
+                m.addAction('Download to this computer', lambda: self.main.download(items, lambda it: f'{r.get("from_name")}’s watchlist'))
+        m.addAction('Details', lambda: self.open_share(r))
+        m.addSeparator()
+        m.addAction('Dismiss', lambda: self.dismiss_want(r))
+        m.exec(pos)
+
+    def dismiss_want(self, r):
+        hidden = self.store.settings.data.setdefault('wants_hidden', [])
+        hidden.append(r['id'])
+        self.store.settings.save()
+        self.render(keep_scroll=True)
+
+    def on_wants(self):
+        if self.current[0] == 'discover' and self.main.stack.currentWidget() is self:
+            self.render(keep_scroll=True)
+        n = sum(1 for r in self.want_requests() if not self.owned_item({'name': r.get('name'), 'kind': r.get('kind')})[0])
+        self.nav['discover'].count = str(n) if n else ''
+        self.nav['discover'].update()
 
     def recommend_to(self, payload):
         from reel import RecommendDialog
@@ -2055,14 +2119,24 @@ class Browser(QWidget):
             if d['id'] not in dl.items:
                 return f'Waiting for {d.get("from") or "your other computer"} to come online  ·  {fmt_size(size)}'
             t = 'Queued' + (f'  ·  {int(got * 100 / size)}% done' if got and size else '') + f'  ·  {fmt_size(size)}'
+            if d.get('why'):
+                t += f'  ·  {d["why"]}'
             return t + (f'  ·  {d["error"]}' if d.get('error') else '')
         if st == 'failed':
             return f'Failed — {d.get("error") or "unknown error"}'
-        return f'On this computer  ·  {fmt_size(size)}'
+        return f'On this computer  ·  {fmt_size(size)}' + (f'  ·  {d["why"]}' if d.get('why') else '')
 
     def play_download(self, d):
         if os.path.isfile(d.get('path', '')):
             self.main.play_path(d['path'])
+
+    def toggle_auto_dl(self):
+        s = self.store.settings.data
+        s['auto_dl_watchlist'] = not s.get('auto_dl_watchlist', True)
+        self.store.settings.save()
+        if s['auto_dl_watchlist']:
+            self.main.auto_download_wants()
+        self.render(keep_scroll=True)
 
     def open_download_folder(self):
         from PyQt6.QtGui import QDesktopServices
@@ -2092,6 +2166,13 @@ class Browser(QWidget):
         of.clicked.connect(self.open_download_folder)
         h.addWidget(of)
         v.addWidget(w)
+        if self.main.cloud.on and self.main.account()['id'] == 'owner':
+            on = self.store.settings.data.get('auto_dl_watchlist', True)
+            ab = PillButton('Auto-download watchlists: On' if on else 'Auto-download watchlists: Off',
+                            'check' if on else None, 'outline' if on else 'ghost', h=34, px=13)
+            ab.setToolTip('Anything on anyone’s watchlist that’s on one of your computers downloads here by itself')
+            ab.clicked.connect(self.toggle_auto_dl)
+            v.addWidget(ab, 0, Qt.AlignmentFlag.AlignLeft)
         folder = self.main.server.library_dir()
         v.addWidget(label(f'Movies and shows from your other computers are saved to  {folder}  so they play without '
                           f'internet.  {fmt_size(free_space(folder))} free.  Downloads keep going while Reel is in the '
