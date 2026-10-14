@@ -36,6 +36,7 @@ class Cloud(QObject):
     synced = pyqtSignal(object, object)  # progress rows, [remote device dicts]
     accounts = pyqtSignal(object)        # [account rows] for the control panel
     revoked = pyqtSignal()               # the owner turned this account off
+    shares = pyqtSignal(object)          # [recommendation rows] someone sent to this account
 
     def __init__(self, store):
         super().__init__()
@@ -106,6 +107,26 @@ class Cloud(QObject):
             except Exception:
                 pass
             self.fetch_accounts()
+        threading.Thread(target=run, daemon=True).start()
+
+    # -- recommendations ("watch this") -------------------------------------------
+    def send_shares(self, rows, cb=None):
+        def run():
+            ok = True
+            try:
+                self._req('POST', 'reel_shares', rows, 'resolution=merge-duplicates')
+            except Exception:
+                ok = False
+            if cb:
+                cb(ok)
+        threading.Thread(target=run, daemon=True).start()
+
+    def dismiss_share(self, sid):
+        def run():
+            try:
+                self._req('DELETE', f'reel_shares?id=eq.{urllib.parse.quote(sid)}')
+            except Exception:
+                pass
         threading.Thread(target=run, daemon=True).start()
 
     def heartbeat(self):
@@ -222,6 +243,11 @@ class Cloud(QObject):
             try:
                 self.heartbeat()                       # presence + revoke check
                 acct = urllib.parse.quote(self.account)
+                try:
+                    self.shares.emit(self._req('GET', f'reel_shares?select=*&to_account=eq.{acct}'
+                                               f'&status=eq.sent&order=t.desc&limit=200') or [])
+                except Exception:
+                    pass
                 progress = self._req('GET', f'reel_progress?select=*&account=eq.{acct}&limit=50000') or []
                 rows = self._req('GET', f'reel_library?select=*&account=eq.{acct}&device=neq.'
                                  f'{urllib.parse.quote(DEVICE)}&limit=50000') or []

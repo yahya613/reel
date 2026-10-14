@@ -538,6 +538,7 @@ class Browser(QWidget):
         self.sort = {'movies': 'added', 'shows': 'added'}
         self._coll_cache = None
         self.account_rows = []
+        self.shares_rows = []
         self.season = {}
         self.history = []
         self.current = ('home', None)
@@ -1263,6 +1264,10 @@ class Browser(QWidget):
         v.addWidget(label('Suggestions based on what you watch. Add things to your watchlist — '
                           'anything you get later shows up in your library automatically.', 13.5, MUTED))
         v.addSpacing(4)
+        if self.shares_rows:
+            senders = ', '.join(dict.fromkeys(s.get('from_name', '') for s in self.shares_rows))
+            v.addWidget(section('Recommended to You', f'from {senders}' if senders else '')[0])
+            v.addWidget(Grid([self.share_card(s) for s in self.shares_rows], 170, max_rows=1))
         wl = self.watchlist()
         if wl:
             w0, h0 = section('Your Watchlist', str(len(wl)))
@@ -1325,9 +1330,24 @@ class Browser(QWidget):
             tb = PillButton('Trailer', 'play-o', 'ghost', h=48, px=15)
             tb.clicked.connect(lambda: self.open_trailer(full['trailer']))
             row.addWidget(tb)
+        rb = PillButton('Recommend', 'users', 'ghost', h=48, px=15)
+        rb.clicked.connect(lambda: self.recommend_to({'kind': cand.get('kind', 'movie'), 'name': cand.get('name'),
+                                                       'year': cand.get('year'), 'meta_id': cand.get('id'),
+                                                       'poster': cand.get('poster'), 'background': cand.get('background')}))
+        row.addWidget(rb)
+        share = cand.get('_share')
+        if share:
+            db = PillButton('Dismiss', 'x', 'ghost', h=48, px=15)
+            db.clicked.connect(lambda: (self.dismiss_share(share), self.back()))
+            row.addWidget(db)
         row.addStretch(1)
         col.addLayout(row)
         col.addSpacing(6)
+        if share and share.get('note'):
+            nb = label(f'“{share["note"]}”  — {share.get("from_name", "a friend")}', 15, ACCENT2, BOLD, wrap=True, maxw=760)
+            col.addWidget(nb)
+        elif share:
+            col.addWidget(label(f'{share.get("from_name", "A friend")} recommended this to you.', 14, ACCENT2, BOLD))
         if desc:
             col.addWidget(label(desc, 15.5, '#cdcdd7', wrap=True, maxw=760))
         if cast:
@@ -1469,6 +1489,68 @@ class Browser(QWidget):
             self.account_rows = [x for x in self.account_rows if x['id'] != a['id']]
             self.render(keep_scroll=True)
 
+    # ------------------------------------------------------------ recommend to someone
+    def on_shares(self, rows):
+        before = {s['id'] for s in self.shares_rows}
+        self.shares_rows = rows or []
+        if {s['id'] for s in self.shares_rows} != before and self.current[0] in ('discover', 'home'):
+            self.render(keep_scroll=True)
+
+    def recommend_to(self, payload):
+        from reel import RecommendDialog
+        me = self.main.account()['id']
+        accounts = [a for a in (self.account_rows or self.main.cloud.accounts_sync())
+                    if a['id'] != me and a.get('active') is not False]
+        if not accounts:
+            self.set_cloud_status('No one to recommend to yet — add an account in People.')
+            return
+        RecommendDialog(self.main, payload, accounts).exec()
+        self.set_cloud_status('Recommendation sent.')
+
+    def movie_payload(self, it):
+        mm = self.movie_meta(it)
+        return {'kind': 'movie', 'name': mm.get('name') or it.title, 'year': it.year or mm.get('year', ''),
+                'meta_id': mm.get('id', ''), 'poster': mm.get('poster', ''), 'background': mm.get('background', '')}
+
+    def show_payload(self, show):
+        sm = self.show_meta(show)
+        return {'kind': 'series', 'name': sm.get('name') or show.name, 'year': sm.get('year') or show.year,
+                'meta_id': sm.get('id', ''), 'poster': sm.get('poster', ''), 'background': sm.get('background', '')}
+
+    def share_card(self, s):
+        def resolve():
+            owned_it, _ = self.owned_item({'name': s.get('name'), 'kind': s.get('kind')})
+            sub = f'from {s.get("from_name", "a friend")}'
+            return {'title': s.get('name', ''), 'sub': sub,
+                    'pix': self.images.remote(s.get('poster')) if s.get('poster') else None,
+                    'icon': 'tv' if s.get('kind') == 'series' else 'film',
+                    'badge': 'IN LIBRARY' if owned_it else 'RECOMMENDED'}
+        return Card('poster', resolve, lambda: self.open_share(s), lambda pos: self.share_menu(s, pos))
+
+    def open_share(self, s):
+        # treat a received recommendation like a Discover title (play if owned, watchlist, trailer)
+        self.go('reco', {'id': s.get('meta_id') or s.get('name'), 'kind': s.get('kind', 'movie'),
+                         'name': s.get('name'), 'year': s.get('year'), 'poster': s.get('poster'),
+                         'background': s.get('background'), '_share': s})
+
+    def share_menu(self, s, pos):
+        m = QMenu(self)
+        m.setStyleSheet(MENU_CSS)
+        m.setFont(font(13.5))
+        owned_it, is_show = self.owned_item({'name': s.get('name'), 'kind': s.get('kind')})
+        if owned_it:
+            m.addAction('Play' if not is_show else 'Open',
+                        lambda: self.open_show(owned_it) if is_show else self.play.emit(owned_it, None))
+        m.addAction('Open', lambda: self.open_share(s))
+        m.addSeparator()
+        m.addAction('Dismiss', lambda: self.dismiss_share(s))
+        m.exec(pos)
+
+    def dismiss_share(self, s):
+        self.main.cloud.dismiss_share(s['id'])
+        self.shares_rows = [x for x in self.shares_rows if x['id'] != s['id']]
+        self.render(keep_scroll=True)
+
     def open_movie(self, it):
         self.go('movie', it)
 
@@ -1512,6 +1594,10 @@ class Browser(QWidget):
         wb = PillButton('Mark unwatched' if watched else 'Mark watched', 'check', 'ghost', h=48, px=15)
         wb.clicked.connect(lambda: (self.store.set_watched(it, not watched), self.render(keep_scroll=True)))
         row.addWidget(wb)
+        if self.main.cloud.on:
+            rb = PillButton('Recommend', 'users', 'ghost', h=48, px=15)
+            rb.clicked.connect(lambda: self.recommend_to(self.movie_payload(it)))
+            row.addWidget(rb)
         self._add_save_button(row, it)
         row.addStretch(1)
         col.addLayout(row)
@@ -1577,6 +1663,10 @@ class Browser(QWidget):
         b = PillButton(txt, 'play', 'light', h=48, px=15)
         b.clicked.connect(lambda: self.play.emit(nxt, None))
         row.addWidget(b)
+        if self.main.cloud.on:
+            rb = PillButton('Recommend', 'users', 'ghost', h=48, px=15)
+            rb.clicked.connect(lambda: self.recommend_to(self.show_payload(show)))
+            row.addWidget(rb)
         row.addStretch(1)
         col.addLayout(row)
         col.addSpacing(6)
@@ -1617,6 +1707,8 @@ class Browser(QWidget):
         w = self.store.watched(it)
         m.addAction('Mark as unwatched' if w else 'Mark as watched',
                     lambda: (self.store.set_watched(it, not w), self.render(keep_scroll=True)))
+        if it.kind == 'movie' and self.main.cloud.on:
+            m.addAction('Recommend to…', lambda: self.recommend_to(self.movie_payload(it)))
         if not it.remote and self.main.can_upload() and not self.main.already_shared(it):
             m.addAction('Save to my library', lambda: self.main.upload_item(it))
         if not it.remote:
@@ -1638,6 +1730,8 @@ class Browser(QWidget):
         m.setStyleSheet(MENU_CSS)
         m.setFont(font(13.5))
         m.addAction('Open', lambda: self.open_show(show))
+        if self.main.cloud.on:
+            m.addAction('Recommend to…', lambda: self.recommend_to(self.show_payload(show)))
         m.addAction('Mark all watched', lambda: ([self.store.set_watched(e, True) for e in show.episodes], self.render(keep_scroll=True)))
         m.addAction('Mark all unwatched', lambda: ([self.store.set_watched(e, False) for e in show.episodes], self.render(keep_scroll=True)))
         local = [e for e in show.episodes if not e.remote]

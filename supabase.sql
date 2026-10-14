@@ -52,13 +52,33 @@ do $$ begin
   end if;
 end $$;
 
+-- Recommendations people send each other ("watch this"). Just a pointer, never the video.
+create table if not exists reel_shares (
+  id           text primary key,     -- <to>|<from>|<title-key>
+  to_account   text,
+  from_account text,
+  from_name    text,
+  kind         text,                 -- movie | series
+  meta_id      text,                 -- cinemeta id if known
+  name         text,
+  year         text,
+  poster       text,
+  background   text,
+  note         text,
+  status       text default 'sent',  -- sent | dismissed
+  t            double precision
+);
+
 -- Personal project: the app talks to these tables with your publishable/anon key.
 alter table reel_progress enable row level security;
 alter table reel_library  enable row level security;
 alter table reel_accounts enable row level security;
+alter table reel_shares   enable row level security;
 drop policy if exists "reel anon" on reel_progress;
 drop policy if exists "reel anon" on reel_library;
 drop policy if exists "reel anon" on reel_accounts;
+drop policy if exists "reel anon" on reel_shares;
 create policy "reel anon" on reel_progress for all to anon using (true) with check (true);
 create policy "reel anon" on reel_library  for all to anon using (true) with check (true);
 create policy "reel anon" on reel_accounts for all to anon using (true) with check (true);
+create policy "reel anon" on reel_shares   for all to anon using (true) with check (true);

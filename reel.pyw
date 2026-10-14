@@ -296,6 +296,61 @@ class AccountDialog(QDialog):
         self.accept()
 
 
+class RecommendDialog(QDialog):
+    """Send 'watch this' to one or more accounts — a recommendation, not the file."""
+    def __init__(self, main, payload, accounts):
+        super().__init__(main)
+        self.main, self.payload = main, payload
+        self.setWindowTitle('Recommend to…')
+        self.setMinimumWidth(420)
+        self.setModal(True)
+        self.setStyleSheet(
+            f'QDialog{{background:{SURFACE}}} QLabel{{color:{TEXT};background:transparent}}'
+            f'QCheckBox{{color:{TEXT};spacing:9px;font-size:15px}}'
+            f'QCheckBox::indicator{{width:18px;height:18px;border-radius:5px;border:1px solid #4a4a58;background:#101016}}'
+            f'QCheckBox::indicator:checked{{background:{ACCENT};border:1px solid {ACCENT};image:url({CHECK_SVG.replace(os.sep, "/")})}}'
+            f'QLineEdit{{background:#101016;color:{TEXT};border:1px solid {BORDER};border-radius:8px;padding:9px 11px;font-size:14px}}')
+        v = QVBoxLayout(self)
+        v.setContentsMargins(26, 22, 26, 20)
+        v.setSpacing(10)
+        v.addWidget(label('Recommend', 22, TEXT, HEAVY))
+        v.addWidget(label(f'“{payload.get("name", "")}” — pick who should watch it.', 13.5, MUTED, wrap=True))
+        self.checks = []
+        for a in accounts:
+            cb = QCheckBox(a.get('name') or a['id'])
+            cb.account = a
+            v.addWidget(cb)
+            self.checks.append(cb)
+        self.note = QLineEdit(placeholderText='Add a note (optional) — e.g. “trust me, watch episode 1”')
+        v.addWidget(self.note)
+        self.msg = label('', 13, MUTED)
+        v.addWidget(self.msg)
+        br = QHBoxLayout()
+        br.addStretch(1)
+        send = PillButton('Send', 'check', 'primary', h=40, px=14)
+        send.clicked.connect(self.send)
+        br.addWidget(send)
+        v.addLayout(br)
+
+    def send(self):
+        import time as _t
+        from cloud import slug
+        picked = [c.account for c in self.checks if c.isChecked()]
+        if not picked:
+            self.msg.setText('Pick at least one person.')
+            return
+        me = self.main.account()
+        p = self.payload
+        key = p.get('meta_id') or slug(p.get('name', ''))
+        rows = [{'id': f'{a["id"]}|{me["id"]}|{key}', 'to_account': a['id'], 'from_account': me['id'],
+                 'from_name': me.get('name') or 'Someone', 'kind': p.get('kind', 'movie'), 'meta_id': p.get('meta_id', ''),
+                 'name': p.get('name', ''), 'year': str(p.get('year', ''))[:9], 'poster': p.get('poster', ''),
+                 'background': p.get('background', ''), 'note': self.note.text().strip(), 'status': 'sent', 't': _t.time()}
+                for a in picked]
+        self.main.cloud.send_shares(rows)
+        self.accept()
+
+
 class Main(QMainWindow):
     tunnel_changed = pyqtSignal()
     scan_progress = pyqtSignal(int, int, str)
@@ -347,6 +402,7 @@ class Main(QMainWindow):
         self.cloud.status.connect(self.browser.set_cloud_status)
         self.cloud.synced.connect(self._on_synced)
         self.cloud.accounts.connect(self.browser.on_accounts)
+        self.cloud.shares.connect(self.browser.on_shares)
         self.cloud.revoked.connect(self.on_revoked)
         self.player.title_changed.connect(lambda t: setattr(self.cloud, 'now_playing', t))
         self.player.closed.connect(lambda: setattr(self.cloud, 'now_playing', ''))
