@@ -22,6 +22,8 @@ Reel finds the video files on your computer, turns them into a proper library wi
 | **Tracks** | One panel for audio track, subtitles (plus loading an .srt), subtitle size and speed. Remembers your subtitle choice **per show**. |
 | **Resume** | Remembers where you stopped. An episode counts as watched near the end, and Continue Watching moves on to the next one. |
 | **Sync** | Optional Supabase sync: where you stopped and what you've watched follow you between computers. |
+| **Downloads** | Keep a copy on this computer of anything that's on your other computers, so it plays without internet. Press **Download** on a movie / show / season, or **Select to download** on Movies / TV Shows to tick several, and they queue up. One at a time in the background (also while Reel sits in the tray), resumes after a restart or a dropped connection, brings the subtitle files along, checks free space, and files episodes under the show's folder in `Reel Library`. Only your own computers (same account). |
+| **Subtitle timing** | Subtitles too early, too late or drifting? The panel's **Subtitle timing** column moves them earlier / later (0.1 s or 1 s), changes their speed, or snaps the previous / next line to *now*. **Auto-sync** listens to the dialogue (centre channel on 5.1) and lines the subtitles up, including 23.976 ↔ 25 fps drift, and only changes anything when it's sure. New subtitle files on this computer get auto-synced on their own. Timing is remembered per title and per subtitle file. |
 | **Streaming** | Every Reel shares its own library. Your other computers stream it over the same Wi-Fi or **from anywhere** through a free Cloudflare quick tunnel. There's no account, no router setup and no Tailscale, and every request needs a secret token. Closing the window keeps sharing from the tray. |
 
 ### Keyboard (player)
@@ -37,7 +39,8 @@ Reel finds the video files on your computer, turns them into a proper library wi
 | N / P | Next / previous episode |
 | 0–9 | Jump to 0–90 % |
 | [ / ] / = | Slower / faster / normal speed |
-| G / H | Subtitle delay −/+ 100 ms |
+| G / H | Subtitles 0.1 s earlier / later (Shift: 1 s) |
+| Y | Auto-sync subtitles to the dialogue |
 | , / . | Frame back / forward |
 | Home | Start over |
 | I | Video info (resolution, codec, decoder) |
@@ -106,6 +109,8 @@ browse.py       sidebar, Home, Movies, TV Shows, detail pages, search
 theme.py        colours, fonts, vector icons, shared widgets
 cloud.py        Supabase sync (progress, libraries, finding other computers)
 server.py       library sharing server (HTTP + Range, token) + Cloudflare tunnel
+downloads.py    download queue: other computers -> this one (resumable)
+subsync.py      subtitle auto-sync (listens via libmpv, matches lines to speech)
 tools/seal.py   encrypt/decrypt the secrets file
 install/        Windows (PowerShell) and Mac (bash) installers
 supabase.sql    database schema

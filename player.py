@@ -1,5 +1,5 @@
 """Player: libmpv rendered into a QOpenGLWidget, with a clean auto-hiding overlay."""
-import os, re, sys, subprocess
+import os, re, sys, time, threading, subprocess
 from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QOpenGLContext, QFontMetricsF, QPainterPath
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -11,6 +11,8 @@ NORMAL = QFont.Weight.Normal
 from theme import (TEXT, MUTED, ACCENT, ACCENT2, font, BOLD, HEAVY, draw_icon, IconButton, PillButton, Fader,
                    Toast, rounded)
 from library import fmt_time, fmt_dur
+from cloud import sync_id
+import subsync
 
 LANGS = {'en': 'English', 'eng': 'English', 'ja': 'Japanese', 'jpn': 'Japanese', 'es': 'Spanish', 'spa': 'Spanish',
          'fr': 'French', 'fre': 'French', 'fra': 'French', 'de': 'German', 'ger': 'German', 'deu': 'German',
@@ -374,6 +376,29 @@ class TextButton(QAbstractButton):
         p.drawText(QRectF(self.rect()), Qt.AlignmentFlag.AlignCenter, self.text())
 
 
+class Chip(TextButton):
+    def __init__(self, text, parent=None, px=13, tip=None):
+        super().__init__(text, parent, px)
+        self.setFixedHeight(32)
+        if tip:
+            self.setToolTip(tip)
+
+    def setText(self, t):
+        QAbstractButton.setText(self, t)
+        self.setFixedWidth(int(QFontMetricsF(font(self.px, BOLD)).horizontalAdvance(t) + 24))
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 46 if self.isDown() else 34 if self.underMouse() else 18))
+        p.drawRoundedRect(QRectF(self.rect()), 16, 16)
+        p.setPen(QColor(TEXT))
+        p.setFont(font(self.px, BOLD))
+        p.drawText(QRectF(self.rect()), Qt.AlignmentFlag.AlignCenter, self.text())
+
+
 class OptionRow(QAbstractButton):
     def __init__(self, text, sub='', selected=False, parent=None):
         super().__init__(parent)
@@ -490,11 +515,74 @@ class TracksPanel(QFrame):
         zrows = [(n, '', abs(scale - v) < .01, lambda _=0, v=v: pl.set_sub_scale(v)) for n, v in SUB_SIZES]
         speed = pl.m.speed or 1.0
         prows = [('Normal' if v == 1 else f'{v:g}×', '', abs(speed - v) < .01, lambda _=0, v=v: pl.set_speed(v)) for v in SPEEDS]
-        self.lay.addWidget(self.column('Audio', arows, 250))
-        self.lay.addWidget(self.column('Subtitles', srows, 260))
-        self.lay.addWidget(self.column('Subtitle size', zrows, 130))
-        self.lay.addWidget(self.column('Speed', prows, 110))
+        for c in (self.column('Audio', arows, 250), self.column('Subtitles', srows, 260),
+                  self.column('Subtitle size', zrows, 130), self.timing_column(262), self.column('Speed', prows, 110)):
+            self.lay.addWidget(c)
+            c.show()              # Qt shows them later otherwise, and hidden columns size the panel to nothing
+        self.lay.activate()
         self.adjustSize()
+
+    def timing_column(self, width):
+        pl = self.player
+        col = QWidget()
+        col.setStyleSheet('background:transparent')
+        v = QVBoxLayout(col)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(7)
+        h = QLabel('SUBTITLE TIMING')
+        h.setFont(font(11, HEAVY))
+        h.setStyleSheet(f'color:{MUTED};letter-spacing:1px;padding:2px 8px 2px 8px;background:transparent')
+        v.addWidget(h)
+
+        def text(t, px=13, color=TEXT, weight=NORMAL):
+            l = QLabel(t)
+            l.setFont(font(px, weight))
+            l.setWordWrap(True)
+            l.setStyleSheet(f'color:{color};background:transparent;padding:0 8px')
+            return l
+
+        def chips(*specs):
+            row = QHBoxLayout()
+            row.setContentsMargins(6, 0, 0, 0)
+            row.setSpacing(5)
+            for label, fn, tip in specs:
+                if fn is None:
+                    row.addWidget(text(label, 13, TEXT, BOLD))
+                    continue
+                b = Chip(label, tip=tip)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            row.addStretch(1)
+            v.addLayout(row)
+
+        if not pl.cur_sub():
+            v.addWidget(text('Turn on subtitles to fix their timing.', 13, MUTED))
+            v.addStretch(1)
+            col.setFixedWidth(width)
+            return col
+        v.addWidget(text(pl.timing_text(long=True), 13.5, TEXT, BOLD))
+        chips(('−1s', lambda: pl.nudge_sub(-1), 'Show subtitles 1 s earlier  (Shift+G)'),
+              ('−0.1', lambda: pl.nudge_sub(-.1), 'Show subtitles 0.1 s earlier  (G)'),
+              ('+0.1', lambda: pl.nudge_sub(.1), 'Show subtitles 0.1 s later  (H)'),
+              ('+1s', lambda: pl.nudge_sub(1), 'Show subtitles 1 s later  (Shift+H)'))
+        v.addWidget(text('← earlier        later →', 11.5, MUTED))
+        sp = (pl.m.sub_speed or 1) * 100
+        chips(('Speed', None, None), ('−', lambda: pl.nudge_sub_speed(-.005), 'Slower — for subtitles that drift later'),
+              (f'{sp:.1f}%', lambda: pl.set_sub_timing(speed=1.0), 'Back to 100%'),
+              ('+', lambda: pl.nudge_sub_speed(.005), 'Faster — for subtitles that drift earlier'))
+        chips(('◀ Prev line now', lambda: pl.sub_step(-1), 'Show the previous subtitle line right now'),
+              ('Next line now ▶', lambda: pl.sub_step(1), 'Show the next subtitle line right now'))
+        busy = pl._sync_job is not None
+        chips(('Listening…' if busy else 'Auto-sync', pl.start_auto_sync,
+               'Reel listens to the dialogue and lines the subtitles up  (Y)'),
+              ('Reset', pl.reset_sub_timing, 'Back to the subtitle file’s own timing'))
+        on = pl.store.settings.data.get('auto_sub_sync', True)
+        r = OptionRow('Auto-sync new subtitles', '', on)
+        r.clicked.connect(pl.toggle_auto_sub_sync)
+        v.addWidget(r)
+        v.addStretch(1)
+        col.setFixedWidth(width)
+        return col
 
 
 class UpNext(QWidget):
@@ -581,6 +669,7 @@ class PlayerView(QWidget):
     title_changed = pyqtSignal(str)
     _prop = pyqtSignal(str, object)
     _event = pyqtSignal(str, object)
+    _synced = pyqtSignal(object)      # (job, result) from the subtitle auto-sync thread
 
     def __init__(self, main):
         super().__init__(main)
@@ -588,6 +677,9 @@ class PlayerView(QWidget):
         self.item = None
         self.tracks, self.chapters = [], []
         self.paused = False
+        self._sub_key = None           # which (title, subtitle track) the current timing belongs to
+        self._sync_job = None
+        self._synced.connect(self._on_synced)
         self.awake = KeepAwake()
         self.upnext_dismissed = False
         self.chapter_kind = ''
@@ -703,6 +795,8 @@ class PlayerView(QWidget):
         if self.item:
             self.save_progress()
         self.item = item
+        self._cancel_sync()
+        self._sub_key = None
         self.upnext.stop()
         self.upnext_dismissed = False
         self.btn_skip.hide()
@@ -787,6 +881,7 @@ class PlayerView(QWidget):
                 self.on_eof()
         elif name == 'track-list':
             self.tracks = v or []
+            self._on_sub_changed()
             self.btn_cc.active = any(t['type'] == 'sub' and t.get('selected') for t in self.tracks)
             self.btn_cc.update()
             if self.panel.isVisible():
@@ -946,6 +1041,178 @@ class PlayerView(QWidget):
         else:
             self.pick_track('audio', ts[(cur + 1) % len(ts)])
 
+    # ---------------------------------------------------------- subtitle timing (you + auto-sync)
+    def cur_sub(self):
+        return next((t for t in self.tracks if t['type'] == 'sub' and t.get('selected')), None)
+
+    def sub_key(self, t=None):
+        """Timing is remembered per title AND per subtitle file/track."""
+        t = t or self.cur_sub()
+        if not t or not self.item:
+            return None
+        ef = t.get('external-filename') or ''
+        if t.get('external'):
+            ident = 'x:' + ((t.get('title') if '://' in ef else os.path.basename(ef)) or str(t.get('id')))
+        else:
+            ident = f"e:{t.get('ff-index', t.get('id'))}:{t.get('lang') or ''}"
+        return f'{sync_id(self.item)}|{ident}'
+
+    def _timings(self):
+        return self.store.settings.data.setdefault('sub_timing', {})
+
+    def _on_sub_changed(self):
+        key = self.sub_key()
+        if key == self._sub_key:
+            return
+        self._sub_key = key
+        self._cancel_sync()
+        rec = self._timings().get(key) if key else None
+        self.m.sub_delay = rec.get('delay', 0) if rec else 0
+        self.m.sub_speed = rec.get('speed', 1) if rec else 1
+        if key and not rec and self._can_auto(self.cur_sub()):
+            QTimer.singleShot(3000, lambda k=key: self.start_auto_sync(manual=False, key=k))
+        if self.panel.isVisible():
+            self.panel.rebuild()
+            self.place()
+
+    def _can_auto(self, t):
+        """Sync on its own only for a local file's external text subtitles (cheap + reliable)."""
+        return bool(t and self.item and not self.item.src and t.get('external')
+                    and (t.get('codec') or 'subrip').lower() in subsync.TEXT_CODECS
+                    and self.store.settings.data.get('auto_sub_sync', True))
+
+    def timing_text(self, long=False):
+        d, s = self.m.sub_delay or 0, self.m.sub_speed or 1
+        parts = []
+        if abs(d) >= .05:
+            parts.append(f'{abs(d):.1f} s {"later" if d > 0 else "earlier"}')
+        if abs(s - 1) > .0005:
+            parts.append(f'speed {s * 100:.1f}%')
+        if not parts:
+            return 'Original timing' if long else 'on original timing'
+        rec = self._timings().get(self._sub_key) or {}
+        who = '  ·  auto-synced' if long and rec.get('by') == 'auto' else ''
+        return ('Shown ' if long else '') + ' · '.join(parts) + who
+
+    def set_sub_timing(self, delay=None, speed=None, by='you', quiet=False):
+        if by == 'you' and self._sync_job and not self._sync_job['manual']:
+            self._cancel_sync()            # you're fixing it by hand: don't let a background sync overwrite it
+        if delay is not None:
+            self.m.sub_delay = round(delay, 3)
+        if speed is not None:
+            self.m.sub_speed = max(.5, min(2.0, speed))
+        if self._sub_key:
+            tm = self._timings()
+            tm[self._sub_key] = {'delay': round(self.m.sub_delay or 0, 3), 'speed': self.m.sub_speed or 1,
+                                 'by': by, 't': time.time()}
+            if len(tm) > 800:             # keep the newest
+                for k in sorted(tm, key=lambda k: tm[k].get('t', 0))[:len(tm) - 800]:
+                    tm.pop(k, None)
+            self.store.settings.save()
+        if not quiet:
+            self.toast.flash('Subtitles ' + self.timing_text(), 1400)
+        if self.panel.isVisible():
+            self.panel.rebuild()
+            self.place()
+
+    def nudge_sub(self, dd):
+        if not self.cur_sub():
+            return self.toast.flash('Subtitles are off', 900)
+        self.set_sub_timing(delay=(self.m.sub_delay or 0) + dd)
+
+    def nudge_sub_speed(self, ds):
+        self.set_sub_timing(speed=round((self.m.sub_speed or 1) + ds, 4))
+
+    def sub_step(self, n):
+        if not self.cur_sub():
+            return
+        try:
+            self.m.command('sub-step', n)
+        except Exception:
+            return self.toast.flash('No subtitle line there', 900)
+        self.set_sub_timing()
+
+    def reset_sub_timing(self):
+        self._cancel_sync()
+        self.set_sub_timing(0, 1)
+
+    def toggle_auto_sub_sync(self):
+        s = self.store.settings.data
+        s['auto_sub_sync'] = not s.get('auto_sub_sync', True)
+        self.store.settings.save()
+        self.toast.flash('Auto-sync ' + ('on — new subtitles get lined up automatically' if s['auto_sub_sync'] else 'off'), 1600)
+        self.panel.rebuild()
+
+    def _cancel_sync(self):
+        if self._sync_job:
+            self._sync_job['cancel'].set()
+            self._sync_job = None
+
+    def start_auto_sync(self, manual=True, key=None):
+        if key is not None and (key != self._sub_key or self._timings().get(key)):
+            return                         # track changed, or someone set it meanwhile
+        t = self.cur_sub()
+        if not t or not self.item:
+            return self.toast.flash('Turn on subtitles first', 1200) if manual else None
+        if self._sync_job:
+            return self.toast.flash('Already syncing…', 900) if manual else None
+        codec = (t.get('codec') or 'subrip').lower()
+        if codec not in subsync.TEXT_CODECS:
+            return self.toast.flash('Auto-sync works with text subtitles — use the timing buttons', 2200) if manual else None
+        if not t.get('external') and (self.item.src or not subsync.ffmpeg_path()):
+            return self.toast.flash('Auto-sync needs a subtitle file (.srt) — use the timing buttons', 2200) if manual else None
+        a = next((x for x in self.tracks if x['type'] == 'audio' and x.get('selected')), None)
+        job = {'cancel': threading.Event(), 'key': self._sub_key, 'manual': manual}
+        self._sync_job = job
+        args = (job, self.item.src or self.item.path, dict(t), self.m.duration or 0, a and a.get('id'),
+                (a or {}).get('demux-channel-count') or 2, bool(self.item.src))
+        threading.Thread(target=self._sync_run, args=args, daemon=True).start()
+        if manual:
+            self.toast.flash('Listening to the dialogue to line up the subtitles…', 3500)
+        if self.panel.isVisible():
+            self.panel.rebuild()
+
+    def _sync_run(self, job, src, t, dur, aid, channels, remote):
+        try:
+            text = (subsync.read_text(t['external-filename']) if t.get('external')
+                    else subsync.extract_embedded(src, t.get('ff-index')))
+            if not text:
+                raise ValueError('couldn’t read the subtitles')
+            res = subsync.auto_sync(src, text, dur, aid=aid, channels=channels, remote=remote, cancel=job['cancel'],
+                                    speeds=subsync.SPEEDS if t.get('external') else (1.0,))
+        except subsync.Cancelled:
+            return
+        except Exception as e:
+            res = {'error': str(e) or type(e).__name__}
+        self._synced.emit((job, res))
+
+    def _on_synced(self, payload):
+        job, res = payload
+        if job is not self._sync_job:
+            return                         # cancelled / superseded
+        self._sync_job = None
+        if job['key'] != self._sub_key:
+            return
+        manual = job['manual']
+        if 'error' in res:
+            if manual:
+                self.toast.flash(f'Couldn’t auto-sync — {res["error"]}', 2600)
+        elif not res['ok']:
+            if manual:
+                self.toast.flash('Couldn’t find a sure match — nudge it with the timing buttons (G / H)', 3000)
+            else:
+                self.set_sub_timing(by='unsure', quiet=True)       # remember we tried; don't redo every time
+        elif abs(res['delay']) < .6 and abs(res['speed'] - 1) < 1e-4:
+            self.set_sub_timing(0, 1, by='checked', quiet=True)     # already matches the dialogue
+            if manual:
+                self.toast.flash('Subtitles already match the dialogue', 2000)
+        else:
+            self.set_sub_timing(res['delay'], res['speed'], by='auto', quiet=True)
+            self.toast.flash('Subtitles synced to the dialogue — ' + self.timing_text(), 3000)
+        if self.panel.isVisible():
+            self.panel.rebuild()
+            self.place()
+
     def load_sub_file(self):
         start = os.path.dirname(self.item.path) if self.item else ''
         f, _ = QFileDialog.getOpenFileName(self, 'Add subtitles', start,
@@ -970,6 +1237,7 @@ class PlayerView(QWidget):
         self.tick_timer.stop()
         self.save_timer.stop()
         self.m.command('stop')
+        self._cancel_sync()
         self.item = None
         self.awake.set(False)
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1063,9 +1331,9 @@ class PlayerView(QWidget):
         elif k == K.Key_Comma:
             self.m.frame_back_step()
         elif k in (K.Key_G, K.Key_H):
-            d = (self.m.sub_delay or 0) + (-.1 if k == K.Key_G else .1)
-            self.m.sub_delay = d
-            self.toast.flash(f'Subtitle delay {d * 1000:+.0f} ms', 900)
+            self.nudge_sub((-1 if k == K.Key_G else 1) * (1 if shift else .1))
+        elif k == K.Key_Y:
+            self.start_auto_sync()
         elif k == K.Key_Home:
             self.m.command('seek', '0', 'absolute')
             self.toast.flash('Starting over', 900)

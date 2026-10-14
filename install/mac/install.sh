@@ -23,7 +23,7 @@ PY="$(brew --prefix python@3.13)/bin/python3.13"
 
 say "Copying Reel to $DEST"
 mkdir -p "$DEST/tools"
-for f in reel.pyw library.py media.py player.py browse.py theme.py cloud.py server.py supabase.sql requirements.txt; do
+for f in reel.pyw library.py media.py player.py browse.py theme.py cloud.py server.py downloads.py subsync.py supabase.sql requirements.txt; do
   [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DEST/"
 done
 [ -f "$ROOT/tools/seal.py" ] && cp "$ROOT/tools/seal.py" "$DEST/tools/"

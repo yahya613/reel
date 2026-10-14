@@ -12,7 +12,7 @@ REPO = 'reel'
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GIST_FILE = os.path.join(ROOT, 'tools', 'gist_id.txt')
 APP_FILES = ['reel.pyw', 'library.py', 'media.py', 'player.py', 'browse.py', 'theme.py', 'cloud.py', 'server.py',
-             'supabase.sql', 'requirements.txt', 'tools/seal.py', 'secrets/seed.json.enc',
+             'downloads.py', 'subsync.py', 'supabase.sql', 'requirements.txt', 'tools/seal.py', 'secrets/seed.json.enc',
              'install/mac/install.sh', 'install/windows/install.ps1']
 
 GET_SH = r'''#!/bin/bash
@@ -63,7 +63,7 @@ GET_PS1 = r'''# Reel one-paste installer for Windows (layer 2).
 
 # App files refreshed by a quick update (no Python/mpv/brew re-download).
 RUNTIME = ['reel.pyw', 'library.py', 'media.py', 'player.py', 'browse.py', 'theme.py', 'cloud.py', 'server.py',
-           'supabase.sql', 'requirements.txt', 'tools/seal.py']
+           'downloads.py', 'subsync.py', 'supabase.sql', 'requirements.txt', 'tools/seal.py']
 
 UPDATE_SH = '''#!/bin/bash
 # Update an existing Reel install (Mac). Paste:  curl -fsSL {base}/update.sh | bash

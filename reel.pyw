@@ -27,6 +27,7 @@ from theme import BG, SURFACE, SURFACE2, BORDER, TEXT, MUTED, ACCENT, font, BOLD
 from media import Images, Metadata, Catalog
 from cloud import Cloud, sync_id
 from server import MediaServer, Tunnel
+from downloads import Downloads
 from player import PlayerView
 from browse import Browser, label, reveal
 
@@ -417,6 +418,8 @@ class Main(QMainWindow):
         self.lib.set_items(list(self.local.items))
         self.server = MediaServer(self.store)
         self.server.start(self.local.items)
+        self.downloads = Downloads(self.store, self.server.library_dir)   # other computers -> this one
+        self.downloads.forget_missing()
         if self.store.settings.data.get('internet_share', True) and self.server.port:
             self.server.tunnel = Tunnel(self.server.port, self.server.token, self.tunnel_changed.emit)
             self.server.tunnel.start()
@@ -458,6 +461,8 @@ class Main(QMainWindow):
         self.servers = []                       # reachable other computers {name, base, token}
         self.server.on_upload = self.uploaded.emit
         self.uploaded.connect(self._on_uploaded)
+        self.downloads.finished.connect(self._on_downloaded)
+        self.downloads.changed.connect(self.browser.on_downloads)
         self.upload_status.connect(self.browser.set_cloud_status)
         self._uploading = False
         self._revoked = False
@@ -658,6 +663,7 @@ class Main(QMainWindow):
                 items.append(it)
         changed_lib = {i.key for i in items} != {i.key for i in self.remote_items}
         self.remote_items = items
+        self.downloads.set_remote(items)   # fresh links (they change); resumes anything waiting for that computer
         if changed_lib:
             self.merge()
         if self.cloud.apply_progress(self.lib.items, progress) or changed_lib:
@@ -744,20 +750,48 @@ class Main(QMainWindow):
 
     def _on_uploaded(self, path):
         # another device sent us a file; add it to this computer's library and share it
+        it = self._add_local(path)
+        if it:
+            self.browser.set_cloud_status(f'Received “{it.display}” — added to your library.')
+
+    def _add_local(self, path):
         try:
             st = os.stat(path)
         except OSError:
-            return
+            return None
         it = parse(path, st.st_size, time.time())
         if it.kind == 'video' or self.local.find(path):
             self.local.save_cache()
-            return
+            return None
         self.local.set_items(list(self.local.items) + [it])
         self.local.save_cache()
         self.server.update(self.local.items)
         self.merge()
         self.cloud.push_library(self.local.items, self.server.info())
-        self.browser.set_cloud_status(f'Received “{it.display}” — added to your library.')
+        return it
+
+    # ------------------------------------------------------------ download from your other computers
+    def download(self, items):
+        items = [i for i in items if i.remote]
+        if not items:
+            return
+        n = self.downloads.add(items, lambda it: self.browser.movie_title(it) if it.kind == 'movie' else it.display)
+        left = len(self.downloads.active())
+        if n:
+            self.browser.set_cloud_status(f'Queued {n} to download · {left} in the queue. '
+                                          'They save to this computer in the background.')
+        else:
+            self.browser.set_cloud_status('Already in your downloads.')
+
+    def _on_downloaded(self, path):
+        it = self._add_local(path)
+        name = it.display if it else os.path.basename(path)
+        left = len(self.downloads.active())
+        self.browser.set_cloud_status(f'Downloaded “{name}” — plays offline now.'
+                                      + (f' {left} more in the queue.' if left else ''))
+        if not left and self.tray.isVisible():
+            self.tray.showMessage('Downloads finished', 'Everything in your queue is on this computer now.',
+                                  QIcon(app_icon(64)), 5000)
 
     def update_status(self, cancelled=False):
         movies = len(self.browser.movies())

@@ -35,7 +35,7 @@ Write-Host "Python: $py"
 # 2. App files + private environment ------------------------------------------------------
 Say "Copying Reel to $Dest"
 New-Item -ItemType Directory -Force "$Dest\lib", "$Dest\tools" | Out-Null
-foreach ($f in 'reel.pyw', 'library.py', 'media.py', 'player.py', 'browse.py', 'theme.py', 'cloud.py', 'server.py',
+foreach ($f in 'reel.pyw', 'library.py', 'media.py', 'player.py', 'browse.py', 'theme.py', 'cloud.py', 'server.py', 'downloads.py', 'subsync.py',
                'supabase.sql', 'requirements.txt') {
     Copy-Item (Join-Path $Root $f) $Dest -Force
 }

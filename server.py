@@ -250,6 +250,9 @@ class MediaServer:
                         pass
 
         class Quiet(ThreadingHTTPServer):
+            # on Windows SO_REUSEADDR lets a second Reel bind the SAME port and steal requests
+            allow_reuse_address = sys.platform != 'win32'
+
             def handle_error(self, request, client_address):
                 pass  # players drop connections all the time when seeking
 

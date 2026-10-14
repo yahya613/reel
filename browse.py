@@ -1,12 +1,13 @@
 """Library UI: sidebar, home, movies, shows, detail pages, search."""
-import os, re, math, time, subprocess, sys, hashlib
+import os, re, math, time, shutil, subprocess, sys, hashlib
 from PyQt6.QtCore import Qt, QRectF, QSize, QTimer, pyqtSignal, QPoint
-from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QFontMetricsF, QFont, QAction, QPixmap
+from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QFontMetricsF, QFont, QAction, QPixmap, QPen
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QScrollArea, QFrame, QLineEdit,
                              QStackedWidget, QAbstractButton, QMenu, QSizePolicy)
 from theme import (BG, SURFACE, SURFACE2, BORDER, TEXT, MUTED, ACCENT, ACCENT2, font, BOLD, HEAVY, draw_icon,
                    qicon, app_icon, rounded, IconButton, PillButton)
 from library import fmt_time, fmt_dur, fmt_size, norm_key
+from cloud import sync_id
 
 NORMAL = QFont.Weight.Normal
 
@@ -110,13 +111,18 @@ class Card(QWidget):
             cover(p, d['pix'], ir, self, align_top=self.shape == 'poster')
         else:
             placeholder(p, ir, d.get('title', ''), d.get('icon', 'film'))
-        if self.hover:
+        sel = d.get('select')
+        if d.get('dim'):
+            p.fillRect(ir, QColor(10, 10, 14, 170))
+        elif self.hover and sel is None:
             p.fillRect(ir, QColor(0, 0, 0, 70))
             c = ir.center()
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(255, 255, 255, 235))
             p.drawEllipse(c, 26, 26)
             draw_icon(p, 'play', QRectF(c.x() - 12, c.y() - 12, 24, 24), '#0a0a0e')
+        elif self.hover:
+            p.fillRect(ir, QColor(0, 0, 0, 40))
         prog = d.get('progress', 0)
         if 0 < prog < 1:
             p.setPen(Qt.PenStyle.NoPen)
@@ -128,10 +134,21 @@ class Card(QWidget):
             p.setBrush(QColor(ACCENT))
             p.drawRoundedRect(QRectF(bar.x(), bar.y(), bar.width() * prog, 4), 2, 2)
         p.restore()
-        if self.hover:
+        if sel:
+            p.setPen(QPen(QColor(ACCENT), 3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(ir.adjusted(1.5, 1.5, -1.5, -1.5), 10, 10)
+        elif self.hover and not d.get('dim'):
             p.setPen(QColor(255, 255, 255, 210))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(ir.adjusted(.75, .75, -.75, -.75), 10, 10)
+        if sel is not None:                # select mode: tick circle, top-left
+            br = QRectF(9, 9, 28, 28)
+            p.setPen(Qt.PenStyle.NoPen if sel else QPen(QColor(255, 255, 255, 235), 2))
+            p.setBrush(QColor(ACCENT) if sel else QColor(0, 0, 0, 120))
+            p.drawEllipse(br)
+            if sel:
+                draw_icon(p, 'check', br.adjusted(6, 6, -6, -6), '#ffffff')
         # corner badges
         p.setPen(Qt.PenStyle.NoPen)
         if d.get('watched'):
@@ -152,7 +169,7 @@ class Card(QWidget):
         if d.get('badge'):
             f = font(11, HEAVY)
             bw = QFontMetricsF(f).horizontalAdvance(d['badge']) + 14
-            br = QRectF(8, 8, bw, 22)
+            br = QRectF(44 if sel is not None else 8, 8 if sel is None else 12, bw, 22)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 170))
             p.drawRoundedRect(br, 6, 6)
@@ -444,7 +461,7 @@ class EpisodeRow(QWidget):
         name = em.get('name') or it.ep_name
         p.drawText(QRectF(x + nw, 18, tw - nw - rw - 10, 22), Qt.AlignmentFlag.AlignVCenter,
                    QFontMetricsF(f).elidedText(name, Qt.TextElideMode.ElideRight, tw - nw - rw - 10))
-        meta = [m for m in (em.get('aired', ''), it.quality, fmt_size(it.size)) if m]
+        meta = [m for m in (em.get('aired', ''), it.quality, fmt_size(it.size), b.dl_short(it)) if m]
         p.setFont(font(12.5))
         p.setPen(QColor(MUTED))
         p.drawText(QRectF(x, 44, tw, 18), Qt.AlignmentFlag.AlignVCenter, '  ·  '.join(meta))
@@ -542,6 +559,12 @@ class Browser(QWidget):
         self.season = {}
         self.history = []
         self.current = ('home', None)
+        self.selecting = False            # "Select to download" mode on Movies / TV Shows
+        self.selected = {}                # card key -> [items]
+        self._page_entries = []           # (key, items) of the selectable cards on screen
+        self._dl_buttons = []
+        self._dl_sig = None
+        self._sid_map = {}
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -570,7 +593,8 @@ class Browser(QWidget):
         sv.addLayout(logo)
         self.nav = {}
         for key, icon, text in (('home', 'home', 'Home'), ('discover', 'sparkles', 'Discover'),
-                                ('movies', 'film', 'Movies'), ('shows', 'tv', 'TV Shows')):
+                                ('movies', 'film', 'Movies'), ('shows', 'tv', 'TV Shows'),
+                                ('downloads', 'download', 'Downloads')):
             b = NavButton(icon, text)
             b.clicked.connect(lambda _=False, k=key: self.go(k))
             b.setStyleSheet('border:none')
@@ -637,7 +661,29 @@ class Browser(QWidget):
         self.page = Page()
         self.pages.addWidget(self.page)
         cv.addWidget(self.pages, 1)
+        # selection bar (bottom) -------------------------------------------
+        self.sel_bar = QFrame()
+        self.sel_bar.setObjectName('selbar')
+        self.sel_bar.setStyleSheet(f'#selbar{{background:#15151c;border-top:1px solid {BORDER}}}')
+        sb = QHBoxLayout(self.sel_bar)
+        sb.setContentsMargins(40, 12, 34, 12)
+        sb.setSpacing(10)
+        self.sel_label = label('', 14.5, TEXT, BOLD)
+        sb.addWidget(self.sel_label)
+        sb.addStretch(1)
+        b_all = PillButton('Select all', None, 'ghost', h=40, px=14)
+        b_all.clicked.connect(self.select_all)
+        sb.addWidget(b_all)
+        b_no = PillButton('Cancel', None, 'ghost', h=40, px=14)
+        b_no.clicked.connect(self.stop_selecting)
+        sb.addWidget(b_no)
+        self.sel_go = PillButton('Download', 'download', 'primary', h=40, px=14)
+        self.sel_go.clicked.connect(self.download_selected)
+        sb.addWidget(self.sel_go)
+        self.sel_bar.hide()
+        cv.addWidget(self.sel_bar)
         root.addWidget(content, 1)
+        self.dl_timer = QTimer(self, singleShot=True, interval=400, timeout=self._dl_refresh)
 
         self.repaint_timer = QTimer(self, singleShot=True, interval=120, timeout=self._repaint_cards)
         self.images.ready.connect(lambda _: self.repaint_timer.start())
@@ -776,17 +822,22 @@ class Browser(QWidget):
             mm = self.movie_meta(it)
             pm = self.images.remote(mm.get('poster')) if mm.get('poster') else None
             sub = '  ·  '.join(x for x in (str(it.year or ''), fmt_dur(self.store.duration(it)) or mm.get('runtime', '')) if x)
-            return {'title': mm.get('name') or it.title, 'sub': sub, 'pix': pm, 'progress': self.store.fraction(it),
-                    'watched': self.store.watched(it), 'icon': 'film'}
-        return Card('poster', resolve, lambda: self.open_movie(it), lambda pos: self.item_menu(it, pos))
+            return self._decorate({'title': mm.get('name') or it.title, 'sub': sub, 'pix': pm,
+                                   'progress': self.store.fraction(it), 'watched': self.store.watched(it),
+                                   'icon': 'film'}, it.key, [it])
+        self._page_entries.append((it.key, [it]))
+        return Card('poster', resolve, lambda: self.card_click(it.key, [it], lambda: self.open_movie(it)),
+                    lambda pos: self.item_menu(it, pos))
 
     def collection_card(self, root, items):
         def resolve():
             unwatched = sum(1 for m in items if not self.store.watched(m))
-            return {'title': self.collection_name(items), 'sub': f'{len(items)} movies', 'pix': self.collection_poster(items),
-                    'icon': 'film', 'count': unwatched if 0 < unwatched < len(items) else 0,
-                    'watched': unwatched == 0, 'stack': True}
-        return Card('poster', resolve, lambda: self.go('collection', root),
+            return self._decorate({'title': self.collection_name(items), 'sub': f'{len(items)} movies',
+                                   'pix': self.collection_poster(items), 'icon': 'film',
+                                   'count': unwatched if 0 < unwatched < len(items) else 0,
+                                   'watched': unwatched == 0, 'stack': True}, f'coll:{root}', items)
+        self._page_entries.append((f'coll:{root}', items))
+        return Card('poster', resolve, lambda: self.card_click(f'coll:{root}', items, lambda: self.go('collection', root)),
                     lambda pos: self.collection_menu(items, pos))
 
     def show_card(self, show):
@@ -796,10 +847,12 @@ class Browser(QWidget):
             unwatched = sum(1 for e in show.episodes if not self.store.watched(e))
             n = len(show.seasons)
             sub = f'{n} seasons' if n > 1 else f'{len(show.episodes)} episode' + ('s' if len(show.episodes) != 1 else '')
-            return {'title': sm.get('name') or show.name, 'sub': sub, 'pix': pm, 'icon': 'tv',
-                    'count': unwatched if unwatched and unwatched != len(show.episodes) else 0,
-                    'watched': unwatched == 0}
-        return Card('poster', resolve, lambda: self.open_show(show), lambda pos: self.show_menu(show, pos))
+            return self._decorate({'title': sm.get('name') or show.name, 'sub': sub, 'pix': pm, 'icon': 'tv',
+                                   'count': unwatched if unwatched and unwatched != len(show.episodes) else 0,
+                                   'watched': unwatched == 0}, show.key, show.episodes)
+        self._page_entries.append((show.key, show.episodes))
+        return Card('poster', resolve, lambda: self.card_click(show.key, show.episodes, lambda: self.open_show(show)),
+                    lambda pos: self.show_menu(show, pos))
 
     def wide_card(self, it, mode=''):
         def resolve():
@@ -860,6 +913,8 @@ class Browser(QWidget):
             self.history.append(self.current)
             self.history = self.history[-30:]
         self.current = (page, arg)
+        if self.selecting and page not in ('movies', 'shows', 'collection', 'search'):
+            self.stop_selecting(render=False)
         if page != 'search' and self.search.text():
             self.search.blockSignals(True)
             self.search.clear()
@@ -881,13 +936,16 @@ class Browser(QWidget):
                          or (k == 'movies' and page in ('movie', 'collection'))
                          or (k == 'discover' and page == 'reco'))
         self.btn_back.setVisible(bool(self.history) and page not in ('home',))
+        self._dl_buttons = []
+        self._page_entries = []
+        self.nav['downloads'].setVisible(bool(self.main.cloud.on or self.main.downloads.queue))
         self.nav['movies'].count = str(len(self.movies())) if self.lib.items else ''
         acct = self.main.account()
         self.btn_account.setText(acct.get('name') or 'Owner')
         {'home': self.render_home, 'discover': self.render_discover, 'movies': self.render_movies,
          'shows': self.render_shows, 'show': self.render_show, 'movie': self.render_movie,
          'collection': self.render_collection, 'reco': self.render_reco, 'accounts': self.render_accounts,
-         'search': self.render_search}[page](arg, keep_scroll)
+         'downloads': self.render_downloads, 'search': self.render_search}[page](arg, keep_scroll)
 
     def _do_search(self):
         q = self.search.text().strip()
@@ -1017,6 +1075,7 @@ class Browser(QWidget):
         # one "entry" per standalone movie or per collection, so sequels fold into one tile
         entries = [('movie', m) for m in singles] + [('coll', root, items) for root, items in colls.items()]
         w, h = section('Movies', f'{total}', top=6)
+        self._select_button(h)
         v.addWidget(w)
         mode = self.sort['movies']
         v.addWidget(pills([('added', 'Recently added'), ('az', 'A–Z'), ('year', 'Year'), ('rating', 'Rating'),
@@ -1079,6 +1138,7 @@ class Browser(QWidget):
         b = PillButton(f'Play {self.movie_title(nxt)}', 'play', 'light', h=46, px=15)
         b.clicked.connect(lambda: self.play.emit(nxt, None))
         row.addWidget(b)
+        self._add_download_button(row, items, 'Download all', h=46)
         row.addStretch(1)
         hb.addLayout(row)
         v.addWidget(hero)
@@ -1106,6 +1166,9 @@ class Browser(QWidget):
         m.addAction(f'Play {self.movie_title(nxt)}', lambda: self.play.emit(nxt, None))
         m.addAction('Mark all watched', lambda: ([self.store.set_watched(x, True) for x in items], self.render(keep_scroll=True)))
         m.addAction('Mark all unwatched', lambda: ([self.store.set_watched(x, False) for x in items], self.render(keep_scroll=True)))
+        if any(x.remote for x in items):
+            m.addSeparator()
+            m.addAction('Download all to this computer', lambda: self.main.download(items))
         m.exec(pos)
 
     def render_shows(self, _, keep_scroll=False):
@@ -1113,6 +1176,7 @@ class Browser(QWidget):
         self.pages.setCurrentWidget(self.page)
         shows = list(self.lib.shows.values())
         w, h = section('TV Shows', f'{len(shows)}', top=6)
+        self._select_button(h)
         v.addWidget(w)
         mode = self.sort['shows']
         v.addWidget(pills([('added', 'Recently added'), ('az', 'A–Z'), ('unwatched', 'Unwatched')], mode,
@@ -1618,6 +1682,7 @@ class Browser(QWidget):
             rb.clicked.connect(lambda: self.recommend_to(self.movie_payload(it)))
             row.addWidget(rb)
         self._add_save_button(row, it)
+        self._add_download_button(row, [it], 'Download')
         row.addStretch(1)
         col.addLayout(row)
         col.addSpacing(6)
@@ -1638,7 +1703,8 @@ class Browser(QWidget):
         iv.setContentsMargins(40, 0, 40, 0)
         iv.addWidget(section('File', top=0)[0])
         if it.remote:
-            iv.addWidget(label(f'In your library  ·  {fmt_size(it.size)}', 13, MUTED, wrap=True))
+            iv.addWidget(label(f'On {it.remote}  ·  {fmt_size(it.size)}  ·  streams from there, or press Download '
+                               f'to keep a copy on this computer', 13, MUTED, wrap=True))
         else:
             iv.addWidget(label(f'{it.path}\n{fmt_size(it.size)}', 13, MUTED, wrap=True))
             sf = PillButton('Show in folder', 'folder', 'ghost', h=36, px=13)
@@ -1686,6 +1752,7 @@ class Browser(QWidget):
             rb = PillButton('Recommend', 'users', 'ghost', h=48, px=15)
             rb.clicked.connect(lambda: self.recommend_to(self.show_payload(show)))
             row.addWidget(rb)
+        self._add_download_button(row, show.episodes, 'Download all')
         row.addStretch(1)
         col.addLayout(row)
         col.addSpacing(6)
@@ -1709,7 +1776,10 @@ class Browser(QWidget):
             iv.addWidget(pills([(s, f'Season {s}' if s else 'Specials') for s in seasons], cur,
                                lambda s: (self.season.__setitem__(show.key, s), self.render(keep_scroll=True))))
         eps = [e for e in show.episodes if e.season == cur]
-        iv.addWidget(section(f'Season {cur}' if cur else 'Episodes', f'{len(eps)} episodes', top=8)[0])
+        sw, sh = section(f'Season {cur}' if cur else 'Episodes', f'{len(eps)} episodes', top=8)
+        if len(seasons) > 1:
+            self._add_download_button(sh, eps, f'Download season {cur}' if cur else 'Download these', h=36, px=13.5)
+        iv.addWidget(sw)
         for e in eps:
             iv.addWidget(EpisodeRow(self, e, lambda e=e: self.play.emit(e, None), lambda pos, e=e: self.item_menu(e, pos)))
         v.addWidget(inner)
@@ -1730,6 +1800,12 @@ class Browser(QWidget):
             m.addAction('Recommend to…', lambda: self.recommend_to(self.movie_payload(it)))
         if not it.remote and self.main.can_upload() and not self.main.already_shared(it):
             m.addAction('Save to my library', lambda: self.main.upload_item(it))
+        if it.remote:
+            d = self.main.downloads.entry(it)
+            if not d or d['state'] == 'failed':
+                m.addAction('Download to this computer', lambda: self.main.download([it]))
+            elif d['state'] in ('queued', 'downloading'):
+                m.addAction('Cancel download', lambda: self.main.downloads.remove(d['id']))
         if not it.remote:
             m.addSeparator()
             m.addAction('Show in folder', lambda: reveal(it.path))
@@ -1753,12 +1829,287 @@ class Browser(QWidget):
             m.addAction('Recommend to…', lambda: self.recommend_to(self.show_payload(show)))
         m.addAction('Mark all watched', lambda: ([self.store.set_watched(e, True) for e in show.episodes], self.render(keep_scroll=True)))
         m.addAction('Mark all unwatched', lambda: ([self.store.set_watched(e, False) for e in show.episodes], self.render(keep_scroll=True)))
+        if any(e.remote for e in show.episodes):
+            m.addAction('Download all to this computer', lambda: self.main.download(show.episodes))
         local = [e for e in show.episodes if not e.remote]
         if local:
             m.addSeparator()
             m.addAction('Show in folder', lambda: reveal(local[0].path))
             m.addAction('Remove from library', lambda: self.main.hide_items(local))
         m.exec(pos)
+
+    # ------------------------------------------------------------ downloads (other computers -> this one)
+    def remote_any(self):
+        return any(i.remote for i in self.lib.items)
+
+    def _dl_state(self, items):
+        """(active entries, failed entries, remote items) for a set of items."""
+        dl = self.main.downloads
+        remote = [i for i in items if i.remote]
+        ents = [e for e in (dl.entry(i) for i in remote) if e]
+        return ([e for e in ents if e['state'] in ('queued', 'downloading')],
+                [e for e in ents if e['state'] == 'failed'], remote)
+
+    def todo_items(self, items):
+        """Remote items that aren't queued / downloaded yet (failed ones count — they get retried)."""
+        dl = self.main.downloads
+        out = []
+        for i in items:
+            e = dl.entry(i) if i.remote else None
+            if i.remote and (not e or e['state'] == 'failed'):
+                out.append(i)
+        return out
+
+    def dl_short(self, it):
+        if not it.remote:
+            return ''
+        d = self.main.downloads.entry(it)
+        if not d:
+            return ''
+        if d['state'] == 'downloading':
+            return f"Downloading {int(d['got'] * 100 / d['size']) if d.get('size') else 0}%"
+        return {'queued': 'Queued to download', 'failed': 'Download failed'}.get(d['state'], '')
+
+    def _decorate(self, d, key, items):
+        """Add select-mode and download badges to a card's paint data."""
+        if self.selecting:
+            if any(i.remote for i in items):
+                d['select'] = key in self.selected
+            else:
+                d['dim'] = True            # already on this computer: nothing to download
+        if not d.get('badge'):
+            active, failed, remote = self._dl_state(items)
+            if active:
+                if len(remote) == 1 and active[0]['state'] == 'downloading':
+                    e = active[0]
+                    d['badge'] = f"DOWNLOADING {int(e['got'] * 100 / e['size']) if e.get('size') else 0}%"
+                else:
+                    d['badge'] = 'DOWNLOADING' if any(e['state'] == 'downloading' for e in active) else 'QUEUED'
+            elif failed:
+                d['badge'] = 'DOWNLOAD FAILED'
+        return d
+
+    def card_click(self, key, items, open_fn):
+        if not self.selecting:
+            return open_fn()
+        if not any(i.remote for i in items):
+            return
+        if key in self.selected:
+            del self.selected[key]
+        else:
+            self.selected[key] = items
+        self.update_sel_bar()
+        self._repaint_cards()
+
+    def _select_button(self, h):
+        if not self.remote_any():
+            return
+        if self.selecting:
+            b = PillButton('Done', 'check', 'ghost', h=36, px=13.5)
+            b.clicked.connect(self.stop_selecting)
+        else:
+            b = PillButton('Select to download', 'download', 'ghost', h=36, px=13.5)
+            b.clicked.connect(self.start_selecting)
+        h.addWidget(b)
+
+    def start_selecting(self):
+        self.selecting = True
+        self.selected = {}
+        self.update_sel_bar()
+        self.render(keep_scroll=True)
+
+    def stop_selecting(self, render=True):
+        self.selecting = False
+        self.selected = {}
+        self.sel_bar.hide()
+        if render:
+            self.render(keep_scroll=True)
+
+    def select_all(self):
+        pick = {k: items for k, items in self._page_entries if any(i.remote for i in items)}
+        self.selected = {} if pick and all(k in self.selected for k in pick) else pick
+        self.update_sel_bar()
+        self._repaint_cards()
+
+    def selected_items(self):
+        out, seen = [], set()
+        for items in self.selected.values():
+            for i in self.todo_items(items):
+                sid = sync_id(i)
+                if sid not in seen:
+                    seen.add(sid)
+                    out.append(i)
+        return out
+
+    def update_sel_bar(self):
+        self.sel_bar.setVisible(self.selecting)
+        if not self.selecting:
+            return
+        items = self.selected_items()
+        size = sum(i.size or 0 for i in items)
+        if not self.selected:
+            self.sel_label.setText('Tap movies or shows to pick what to download')
+        else:
+            n = len(self.selected)
+            free = free_space(self.main.server.library_dir())
+            warn = '  ·  not enough space!' if size > free else ''
+            self.sel_label.setText(f'{n} selected  ·  {len(items)} file' + ('s' if len(items) != 1 else '') +
+                                   f'  ·  {fmt_size(size)}  ·  {fmt_size(free)} free{warn}')
+        self.sel_go.setText(f'Download {fmt_size(size)}' if items else 'Download')
+
+    def download_selected(self):
+        items = self.selected_items()
+        if not items:
+            return
+        self.main.download(items)
+        self.stop_selecting(render=False)
+        self.go('downloads')
+
+    def _add_download_button(self, row, items, text, h=48, px=15):
+        if not any(i.remote for i in items):
+            return
+        b = PillButton(text, 'download', 'ghost', h=h, px=px)
+        self._dl_buttons.append((b, items, text))
+        self._set_dl_button(b, items, text)
+        b.clicked.connect(lambda: self._dl_button_click(items))
+        row.addWidget(b)
+
+    def _set_dl_button(self, b, items, text):
+        active, failed, remote = self._dl_state(items)
+        todo = self.todo_items(items)
+        if active:
+            if len(remote) == 1:
+                e = active[0]
+                pct = int(e['got'] * 100 / e['size']) if e.get('size') else 0
+                t = f'Downloading {pct}%' if e['state'] == 'downloading' else 'Queued'
+            else:
+                t = f'Downloading · {len(active)} left'
+        elif failed and len(remote) == 1:
+            t = 'Retry download'
+        elif todo:
+            t = f'{text}  ·  {fmt_size(sum(i.size or 0 for i in todo))}'
+        else:
+            t = text
+        if b.text() != t:
+            b.setText(t)
+
+    def _dl_button_click(self, items):
+        if not self.todo_items(items):    # all queued already: show the queue
+            return self.go('downloads')
+        self.main.download(items)
+        for b, its, text in self._dl_buttons:
+            try:
+                self._set_dl_button(b, its, text)
+            except RuntimeError:
+                pass
+        self.repaint_timer.start()
+
+    def on_downloads(self):
+        if not self.dl_timer.isActive():
+            self.dl_timer.start()
+
+    def _dl_refresh(self):
+        dl = self.main.downloads
+        n = len(dl.active())
+        nb = self.nav['downloads']
+        nb.count = str(n) if n else ''
+        nb.setVisible(bool(self.main.cloud.on or dl.queue))
+        nb.update()
+        for b, items, text in list(self._dl_buttons):
+            try:
+                self._set_dl_button(b, items, text)
+            except RuntimeError:          # button's page was replaced
+                pass
+        if self.current[0] == 'downloads' and self.main.stack.currentWidget() is self:
+            if [(d['id'], d['state']) for d in dl.queue] != self._dl_sig:
+                self.render(keep_scroll=True)
+            else:
+                for r in self.page.findChildren(DownloadRow):
+                    r.refresh()
+        else:
+            self._repaint_cards()
+        if self.selecting:
+            self.update_sel_bar()
+
+    def dl_item(self, d):
+        return self._sid_map.get(d['id'])
+
+    def dl_poster(self, d):
+        it = self.dl_item(d)
+        if not it:
+            return None
+        m = self.show_meta(self.lib.show_of(it)) if it.kind == 'episode' else self.movie_meta(it)
+        return self.images.remote(m.get('poster')) if m.get('poster') else None
+
+    def dl_status(self, d):
+        dl = self.main.downloads
+        st, got, size = d.get('state'), d.get('got', 0), d.get('size', 0)
+        if st == 'downloading':
+            bits = [f'{int(got * 100 / size)}%' if size else '', f'{fmt_size(got)} of {fmt_size(size)}' if size else fmt_size(got)]
+            if dl.rate > 0:
+                bits.append(f'{dl.rate / 1024**2:.1f} MB/s')
+                if size:
+                    bits.append(f'{eta(max(0, size - got) / dl.rate)} left')
+            return '  ·  '.join(b for b in bits if b)
+        if st == 'queued':
+            if d['id'] not in dl.items:
+                return f'Waiting for {d.get("from") or "your other computer"} to come online  ·  {fmt_size(size)}'
+            t = 'Queued' + (f'  ·  {int(got * 100 / size)}% done' if got and size else '') + f'  ·  {fmt_size(size)}'
+            if d.get('from'):
+                t += f'  ·  from {d["from"]}'
+            return t + (f'  ·  {d["error"]}' if d.get('error') else '')
+        if st == 'failed':
+            return f'Failed — {d.get("error") or "unknown error"}'
+        return f'On this computer  ·  {fmt_size(size)}'
+
+    def play_download(self, d):
+        if os.path.isfile(d.get('path', '')):
+            self.main.play_path(d['path'])
+
+    def open_download_folder(self):
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        folder = self.main.server.library_dir()
+        os.makedirs(folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def render_downloads(self, _, keep_scroll=False):
+        v = self.page.fresh(keep_scroll=keep_scroll)
+        self.pages.setCurrentWidget(self.page)
+        dl = self.main.downloads
+        q = list(dl.queue)
+        self._dl_sig = [(d['id'], d['state']) for d in q]
+        self._sid_map = {sync_id(i): i for i in self.lib.items}
+        active = dl.active()
+        w, h = section('Downloads', f'{len(active)} in the queue' if active else None, top=6)
+        if self.remote_any():
+            pick = PillButton('Pick movies & shows', 'download', 'primary', h=36, px=13.5)
+            pick.clicked.connect(lambda: (self.go('movies'), self.start_selecting()))
+            h.addWidget(pick)
+        if any(d['state'] == 'done' for d in q):
+            cl = PillButton('Clear finished', None, 'ghost', h=36, px=13.5)
+            cl.clicked.connect(lambda: (dl.clear_done(), self.render(keep_scroll=True)))
+            h.addWidget(cl)
+        of = PillButton('Open folder', 'folder', 'ghost', h=36, px=13.5)
+        of.clicked.connect(self.open_download_folder)
+        h.addWidget(of)
+        v.addWidget(w)
+        folder = self.main.server.library_dir()
+        v.addWidget(label(f'Movies and shows from your other computers are saved to  {folder}  so they play without '
+                          f'internet.  {fmt_size(free_space(folder))} free.  Downloads keep going while Reel is in the '
+                          f'tray, and pick up where they left off after a restart.', 13.5, MUTED, wrap=True, maxw=900))
+        v.addSpacing(4)
+        if not q:
+            msg = ('Nothing here yet. Press “Pick movies & shows” (or “Select to download” on Movies / TV Shows), '
+                   'tap the ones you want, then Download.') if self.remote_any() else \
+                  ('Nothing to download yet — once your other computer is online with Reel open, '
+                   'its movies and shows show up here to grab.')
+            v.addWidget(label(msg, 15, MUTED, wrap=True, maxw=760))
+        order = {'downloading': 0, 'queued': 1, 'failed': 2, 'done': 3}
+        q.sort(key=lambda d: (order.get(d['state'], 4), -d.get('finished', 0) if d['state'] == 'done' else d.get('added', 0)))
+        for d in q:
+            v.addWidget(DownloadRow(self, d))
+        v.addStretch(1)
 
     # ------------------------------------------------------------ scan status
     def set_cloud_status(self, text):
@@ -1769,6 +2120,93 @@ class Browser(QWidget):
         self.scan_status.setText(text)
         self.scan_bar.set_active(active)
         self.btn_scan.setText('Stop scan' if active else 'Scan computer')
+
+
+def free_space(path):
+    while path and not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return 0
+
+
+def eta(secs):
+    secs = int(secs)
+    if secs < 60:
+        return 'under a minute'
+    h, m = secs // 3600, secs % 3600 // 60
+    return f'{h}h {m}m' if h else f'{m} min'
+
+
+class ProgressLine(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(6)
+        self.frac, self.color = 0.0, ACCENT
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 26))
+        p.drawRoundedRect(r, 3, 3)
+        if self.frac > 0:
+            p.setBrush(QColor(self.color))
+            p.drawRoundedRect(QRectF(0, 0, r.width() * min(1.0, self.frac), r.height()), 3, 3)
+
+
+class DownloadRow(QFrame):
+    def __init__(self, browser, d):
+        super().__init__()
+        self.b, self.d = browser, d
+        dl = browser.main.downloads
+        self.setObjectName('dlrow')
+        self.setStyleSheet(f'#dlrow{{background:{SURFACE};border:1px solid {BORDER};border-radius:14px}}')
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 12, 16, 12)
+        h.setSpacing(16)
+        h.addWidget(ImageBox(lambda: browser.dl_poster(d), 52, 78, '',
+                             'tv' if d.get('kind') == 'episode' else 'film', 8))
+        col = QVBoxLayout()
+        col.setSpacing(7)
+        col.addStretch(1)
+        col.addWidget(label(d.get('name', ''), 15.5, TEXT, BOLD))
+        self.status = label('', 13, MUTED, wrap=True)
+        col.addWidget(self.status)
+        self.bar = ProgressLine()
+        col.addWidget(self.bar)
+        col.addStretch(1)
+        h.addLayout(col, 1)
+        st = d.get('state')
+        if st == 'done':
+            pb = PillButton('Play', 'play', 'light', h=38, px=13.5)
+            pb.clicked.connect(lambda: browser.play_download(d))
+            h.addWidget(pb)
+            fb = IconButton('folder', 38, 19, tip='Show in folder')
+            fb.clicked.connect(lambda: reveal(d['path']) if os.path.exists(d.get('path', '')) else None)
+            h.addWidget(fb)
+        elif st == 'failed':
+            rb = PillButton('Retry', 'refresh', 'ghost', h=38, px=13.5)
+            rb.clicked.connect(lambda: dl.retry(d['id']))
+            h.addWidget(rb)
+        xb = IconButton('x', 38, 18, tip='Remove from list (keeps the file)' if st == 'done' else 'Cancel download')
+        xb.clicked.connect(lambda: (dl.remove(d['id']), browser.render(keep_scroll=True)))
+        h.addWidget(xb)
+        self.refresh()
+
+    def refresh(self):
+        d = self.d
+        self.status.setText(self.b.dl_status(d))
+        size = d.get('size') or 0
+        self.bar.frac = (d.get('got', 0) / size) if size else 0
+        self.bar.color = ACCENT if d.get('state') == 'downloading' else '#6a6a78'
+        self.bar.setVisible(d.get('state') != 'done')
+        self.bar.update()
 
 
 def reveal(path):
