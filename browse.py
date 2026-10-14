@@ -1369,9 +1369,26 @@ class Browser(QWidget):
         QDesktopServices.openUrl(QUrl(url))
 
     # ------------------------------------------------------------ accounts
+    ROLE_RANK = {'owner': 4, 'admin': 3, 'moderator': 2, 'tester': 1, 'viewer': 0}
+
+    def my_role(self):
+        return self.main.account().get('role', 'owner')
+
+    def my_rank(self):
+        return self.ROLE_RANK.get(self.my_role(), 0)
+
+    def can_panel(self):
+        return self.my_role() in ('owner', 'admin', 'moderator')
+
+    def can_manage(self):
+        return self.my_role() in ('owner', 'admin')
+
+    def can_act_on(self, a):
+        return (self.can_panel() and a.get('role') != 'owner'
+                and self.my_rank() > self.ROLE_RANK.get(a.get('role'), 0))
+
     def account_tapped(self):
-        acct = self.main.account()
-        if acct.get('role') == 'owner':
+        if self.can_panel():
             self.go('accounts')
         else:
             m = QMenu(self)
@@ -1388,8 +1405,8 @@ class Browser(QWidget):
     def render_accounts(self, _, keep_scroll=False):
         v = self.page.fresh(keep_scroll=keep_scroll)
         self.pages.setCurrentWidget(self.page)
-        if self.main.account().get('role') != 'owner':
-            v.addWidget(label('Only the owner can manage accounts.', 15, MUTED))
+        if not self.can_panel():
+            v.addWidget(label('You don’t have access to account management.', 15, MUTED))
             v.addStretch(1)
             return
         self.main.cloud.fetch_accounts()
@@ -1398,10 +1415,11 @@ class Browser(QWidget):
         v.addWidget(label('Everyone has their own watch history, library and recommendations. '
                           'Add someone, then give them their name + PIN. Revoke to cut their access instantly.', 13.5, MUTED))
         v.addSpacing(6)
-        add = PillButton('Add account', 'plus', 'primary', h=40, px=14)
-        add.clicked.connect(self.add_account)
-        v.addWidget(add, 0, Qt.AlignmentFlag.AlignLeft)
-        v.addSpacing(6)
+        if self.can_manage():
+            add = PillButton('Add account', 'plus', 'primary', h=40, px=14)
+            add.clicked.connect(self.add_account)
+            v.addWidget(add, 0, Qt.AlignmentFlag.AlignLeft)
+            v.addSpacing(6)
         rows = sorted(self.account_rows, key=lambda a: (a.get('role') != 'owner', (a.get('name') or '').lower()))
         if not rows:
             v.addWidget(label('Loading…', 14, MUTED))
@@ -1423,7 +1441,7 @@ class Browser(QWidget):
         h.addWidget(dot, 0, Qt.AlignmentFlag.AlignTop)
         col = QVBoxLayout()
         col.setSpacing(2)
-        name = (a.get('name') or a['id']) + ('  ·  owner' if a.get('role') == 'owner' else '')
+        name = (a.get('name') or a['id']) + f'  ·  {a.get("role", "viewer")}'
         nl = label(name + ('   (revoked)' if revoked else ''), 16, '#8c8c9b' if revoked else TEXT, BOLD)
         nl.setStyleSheet(f'color:{"#8c8c9b" if revoked else TEXT};background:transparent;border:none')
         col.addWidget(nl)
@@ -1441,7 +1459,7 @@ class Browser(QWidget):
         s.setStyleSheet(f'color:{MUTED};background:transparent;border:none')
         col.addWidget(s)
         h.addLayout(col, 1)
-        if a.get('role') != 'owner':
+        if self.can_act_on(a):
             if revoked:
                 rb = PillButton('Restore', None, 'ghost', h=34, px=13)
                 rb.clicked.connect(lambda _=0, a=a: self.set_active(a, True))
@@ -1450,29 +1468,30 @@ class Browser(QWidget):
                 kb = PillButton('Revoke', 'power', 'ghost', h=34, px=13)
                 kb.clicked.connect(lambda _=0, a=a: self.set_active(a, False))
                 h.addWidget(kb)
-            xb = IconButton('x', 34, 16, tip='Delete account')
-            xb.clicked.connect(lambda _=0, a=a: self.remove_account(a))
-            h.addWidget(xb)
+            if self.can_manage():
+                xb = IconButton('x', 34, 16, tip='Delete account')
+                xb.clicked.connect(lambda _=0, a=a: self.remove_account(a))
+                h.addWidget(xb)
         return card
 
     def add_account(self):
-        from PyQt6.QtWidgets import QInputDialog, QLineEdit as QLE
-        name, ok = QInputDialog.getText(self, 'Add account', 'Name:')
-        if not (ok and name.strip()):
+        if not self.can_manage():
             return
-        pin, ok = QInputDialog.getText(self, 'Add account', f'PIN for {name.strip()} (4+ digits):', QLE.EchoMode.Normal)
-        if not (ok and len(pin.strip()) >= 4):
-            if ok:
-                self.set_cloud_status('PIN must be at least 4 digits.')
+        from reel import AddAccountDialog
+        roles = [r for r in ('admin', 'moderator', 'tester', 'viewer')
+                 if self.ROLE_RANK[r] < self.my_rank()]
+        dlg = AddAccountDialog(self.main, roles)
+        if not dlg.exec() or not dlg.result_row:
             return
+        r = dlg.result_row
         import time as _t
         from cloud import slug
-        aid = slug(name)
-        if aid in ('owner',) or any(a['id'] == aid for a in self.account_rows):
+        aid = slug(r['name'])
+        if aid == 'owner' or any(a['id'] == aid for a in self.account_rows):
             aid = aid + '-' + str(int(_t.time()) % 1000)
-        self.main.cloud.save_account({'id': aid, 'name': name.strip(), 'pin': pin.strip(), 'role': 'member',
+        self.main.cloud.save_account({'id': aid, 'name': r['name'], 'pin': r['pin'], 'role': r['role'],
                                       'active': True, 't': _t.time()})
-        self.set_cloud_status(f'Added {name.strip()} — PIN {pin.strip()}')
+        self.set_cloud_status(f'Added {r["name"]} ({r["role"]}) — PIN {r["pin"]}')
         QTimer.singleShot(900, lambda: self.render(keep_scroll=True))
 
     def set_active(self, a, active):

@@ -19,7 +19,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QFileSystemWatcher, QObject, QE
 from PyQt6.QtGui import QIcon, QPalette, QColor, QFont, QSurfaceFormat
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QFileDialog, QDialog, QVBoxLayout,
                              QHBoxLayout, QLabel, QCheckBox, QSpinBox, QWidget, QFrame, QLineEdit,
-                             QSystemTrayIcon, QMenu)
+                             QSystemTrayIcon, QMenu, QComboBox)
 
 import library
 from library import Library, Store, parse, path_key, fmt_dur, DATA_DIR, VIDEO_EXT
@@ -293,6 +293,55 @@ class AccountDialog(QDialog):
             return
         self._save_local(a['id'], a.get('name') or a['id'], a.get('role', 'member'), a.get('pin'))
         self.picked = a
+        self.accept()
+
+
+class AddAccountDialog(QDialog):
+    """Create an account with a role."""
+    def __init__(self, main, roles):
+        super().__init__(main)
+        self.result_row = None
+        self.setWindowTitle('Add account')
+        self.setMinimumWidth(400)
+        self.setModal(True)
+        self.setStyleSheet(
+            f'QDialog{{background:{SURFACE}}} QLabel{{color:{TEXT};background:transparent}}'
+            f'QLineEdit,QComboBox{{background:#101016;color:{TEXT};border:1px solid {BORDER};border-radius:8px;padding:9px 11px;font-size:14px}}'
+            f'QComboBox QAbstractItemView{{background:#14141b;color:{TEXT};selection-background-color:{ACCENT}}}')
+        v = QVBoxLayout(self)
+        v.setContentsMargins(26, 22, 26, 20)
+        v.setSpacing(10)
+        v.addWidget(label('Add account', 22, TEXT, HEAVY))
+        self.name = QLineEdit(placeholderText='Name')
+        self.pin = QLineEdit(placeholderText='PIN (4+ digits)')
+        self.pin.setEchoMode(QLineEdit.EchoMode.Password)
+        v.addWidget(self.name)
+        v.addWidget(self.pin)
+        v.addWidget(label('Role', 13, MUTED))
+        self.role = QComboBox()
+        DESC = {'admin': 'Admin — co-owner: manage accounts, revoke anyone',
+                'moderator': 'Moderator — revoke testers & viewers, no add/delete',
+                'tester': 'Tester — watcher, gets early features',
+                'viewer': 'Viewer — normal watcher'}
+        for r in roles:
+            self.role.addItem(DESC.get(r, r), r)
+        v.addWidget(self.role)
+        self.msg = label('', 13, '#ff8080')
+        v.addWidget(self.msg)
+        br = QHBoxLayout()
+        br.addStretch(1)
+        b = PillButton('Create', None, 'primary', h=40, px=14)
+        b.clicked.connect(self.create)
+        br.addWidget(b)
+        v.addLayout(br)
+
+    def create(self):
+        name = self.name.text().strip()
+        pin = self.pin.text().strip()
+        if not name or len(pin) < 4:
+            self.msg.setText('Enter a name and a PIN of at least 4 digits.')
+            return
+        self.result_row = {'name': name, 'pin': pin, 'role': self.role.currentData()}
         self.accept()
 
 
